@@ -10,6 +10,10 @@ inference pipeline on a single GPU:
 
 
 from causvid.models.wan.causal_stream_inference import CausalStreamInferencePipeline
+
+# --- TensorRT Acceleration Imports ---
+from streamv2v.acceleration.tensorrt.engine_manager import EngineManager
+from streamv2v.acceleration.tensorrt.builder import EngineBuilder
 from diffusers.utils import export_to_video
 from causvid.data import TextDataset
 from omegaconf import OmegaConf
@@ -95,6 +99,37 @@ def compute_noise_scale_and_step(input_video_original: torch.Tensor, end_idx: in
     return new_noise_scale, current_step
 
 class SingleGPUInferencePipeline:
+    def __init__(self, config, device: torch.device, acceleration="pytorch", engine_dir=None):
+        self.config = config
+        self.device = device
+        self.acceleration = acceleration
+        self.engine_dir = engine_dir
+        self.logger = logging.getLogger("SingleGPUInference")
+        self.logger.setLevel(logging.INFO)
+        self.logger.propagate = False
+        if not self.logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
+
+        # TensorRT engine manager
+        if self.acceleration == "tensorrt":
+            if self.engine_dir is None:
+                raise ValueError("engine_dir must be specified for TensorRT acceleration.")
+            self.engine_manager = EngineManager(self.engine_dir)
+        else:
+            self.engine_manager = None
+
+        # Initialize pipeline
+        self.pipeline = CausalStreamInferencePipeline(config, device=str(device))
+        self.pipeline.to(device=str(device), dtype=torch.bfloat16)
+        self.t_dit = 100.0
+        self.t_total = 100.0
+        self.processed = 0
+        self.logger.info(f"Single GPU inference pipeline manager initialized (acceleration: {self.acceleration})")
+
+    # ...existing code...
     """
     Single GPU Inference Pipeline Manager
     
@@ -333,6 +368,8 @@ def main():
     parser.add_argument("--num_frames", type=int, default=81, help="Video length (number of frames)")
     parser.add_argument("--fixed_noise_scale", action="store_true", default=False)
     parser.add_argument("--img2img", action="store_true", default=False, help="Enable img2img mode: extract a single frame from img2vid output.")
+    parser.add_argument("--acceleration", type=str, default="pytorch", choices=["pytorch", "tensorrt"], help="Acceleration backend: pytorch or tensorrt")
+    parser.add_argument("--engine_dir", type=str, default=None, help="Directory for TensorRT engines (required if --acceleration tensorrt)")
     args = parser.parse_args()
     
     torch.set_grad_enabled(False)
@@ -386,13 +423,17 @@ def main():
         input_video_original = None
         t = args.num_frames
 
+    # Select acceleration backend
+    acceleration = args.acceleration
+    engine_dir = args.engine_dir
+
     # Optimized img2img path
     if args.image_path is not None and args.img2img:
         import os
         import numpy as np
         import imageio
         # --- Fast img2img: skip chunking, cache, and video logic ---
-        pipeline_manager = SingleGPUInferencePipeline(config, device)
+        pipeline_manager = SingleGPUInferencePipeline(config, device, acceleration=acceleration, engine_dir=engine_dir)
         pipeline_manager.load_model(args.checkpoint_folder)
         dataset = TextDataset(args.prompt_file_path)
         prompts = [dataset[0]]
@@ -443,7 +484,7 @@ def main():
         # Default: video or img2vid path
         chunck_size = 4
         num_chuncks = (t - 1) // chunck_size
-        pipeline_manager = SingleGPUInferencePipeline(config, device)
+        pipeline_manager = SingleGPUInferencePipeline(config, device, acceleration=acceleration, engine_dir=engine_dir)
         pipeline_manager.load_model(args.checkpoint_folder)
         dataset = TextDataset(args.prompt_file_path)
         prompts = [dataset[0]]
