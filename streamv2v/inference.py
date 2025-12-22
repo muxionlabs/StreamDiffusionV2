@@ -128,49 +128,6 @@ class SingleGPUInferencePipeline:
         self.t_total = 100.0
         self.processed = 0
         self.logger.info(f"Single GPU inference pipeline manager initialized (acceleration: {self.acceleration})")
-
-    # ...existing code...
-    """
-    Single GPU Inference Pipeline Manager
-    
-    This class encapsulates the complete inference logic on a single GPU, 
-    including encoding, inference, and decoding.
-    """
-    
-    def __init__(self, config, device: torch.device):
-        """
-        Initialize the single GPU inference pipeline manager.
-        
-        Args:
-            config: Configuration object
-            device: GPU device
-        """
-        self.config = config
-        self.device = device
-        
-        # Setup logging
-        self.logger = logging.getLogger("SingleGPUInference")
-        self.logger.setLevel(logging.INFO)
-        # Prevent messages from propagating to the root logger (avoid double prints)
-        self.logger.propagate = False
-        
-        if not self.logger.handlers:
-            handler = logging.StreamHandler()
-            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-            handler.setFormatter(formatter)
-            self.logger.addHandler(handler)
-        
-        # Initialize pipeline
-        self.pipeline = CausalStreamInferencePipeline(config, device=str(device))
-        self.pipeline.to(device=str(device), dtype=torch.bfloat16)
-        
-        # Performance tracking
-        self.t_dit = 100.0
-        self.t_total = 100.0
-        self.processed = 0
-
-        
-        self.logger.info("Single GPU inference pipeline manager initialized")
     
     def load_model(self, checkpoint_folder: str):
         """Load the model from checkpoint."""
@@ -214,20 +171,40 @@ class SingleGPUInferencePipeline:
                 current_start=current_start,
                 current_end=current_end
             )
-            # Prepare dummy input for engine (assuming single input for now)
-            # You may need to adapt this for your model's input signature
-            dummy_input = noise.cpu().numpy().astype(np.float16)
+            # Prepare all required dummy inputs for ONNX export (noise, t, context, seq_len)
+            # Shapes must match what the model expects
+            # noise: [B, C, T, H, W] (already provided)
+            batch = noise.shape[0]
+            device = noise.device
+            # t: [B, T] (frame indices)
+            t = torch.arange(noise.shape[2], dtype=torch.long, device=device).unsqueeze(0).repeat(batch, 1)
+            # context: [B, context_len, context_dim] (dummy text embedding)
+            context_len = 77  # typical CLIP context length, adjust as needed
+            context_dim = 1024  # typical CLIP embedding dim, adjust as needed
+            context = torch.zeros((batch, context_len, context_dim), dtype=torch.float32, device=device)
+            # seq_len: int (sequence length)
+            seq_len = torch.tensor([noise.shape[2]], dtype=torch.long, device=device)
+            # Prepare all dummy inputs as PyTorch tensors for ONNX export
+            dummy_noise = noise.to(torch.float16)
+            dummy_t = t
+            dummy_context = context
+            dummy_seq_len = seq_len
+            dummy_inputs = (dummy_noise, dummy_t, dummy_context, dummy_seq_len)
             engine = self.engine_manager.get_or_build_engine(
                 builder=EngineBuilder(self.pipeline.generator.model, self.engine_dir),
-                dummy_inputs=(noise,),
+                dummy_inputs=dummy_inputs,
                 name_prefix="generator",
                 opset=17,
                 force_export=False
             )
-            # Prepare input dict for TRTInferenceWrapper
-            # This assumes a single input named 'input' (adapt as needed)
-            input_name = engine.input_names[0]
-            inputs_dict = {input_name: dummy_input}
+            # For inference, convert to numpy arrays
+            input_names = engine.input_names
+            inputs_dict = {
+                input_names[0]: dummy_noise.cpu().numpy(),
+                input_names[1]: dummy_t.cpu().numpy(),
+                input_names[2]: dummy_context.cpu().numpy(),
+                input_names[3]: dummy_seq_len.cpu().numpy(),
+            }
             outputs = engine.infer(inputs_dict)
             # Convert output to torch tensor and move to device
             denoised_pred = torch.from_numpy(outputs[0]).to(self.device)
