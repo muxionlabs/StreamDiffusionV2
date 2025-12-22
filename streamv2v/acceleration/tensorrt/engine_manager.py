@@ -1,5 +1,6 @@
 
 import os
+from streamv2v.acceleration.tensorrt.runtime import TRTInferenceWrapper
 
 class EngineManager:
 	def __init__(self, engine_dir):
@@ -17,10 +18,9 @@ class EngineManager:
 		engine_path = self.get_engine_path(name_prefix)
 		if not os.path.exists(engine_path):
 			raise FileNotFoundError(f"TensorRT engine not found: {engine_path}")
-		# Placeholder: actual TensorRT engine loading logic goes here
-		print(f"[TODO] Load TensorRT engine from {engine_path}")
-		self.engines[name_prefix] = engine_path
-		return engine_path
+		if name_prefix not in self.engines:
+			self.engines[name_prefix] = TRTInferenceWrapper(engine_path)
+		return self.engines[name_prefix]
 
 	def get_or_build_engine(self, builder, dummy_inputs, name_prefix="model", opset=17, force_export=False):
 		if not self.has_engine(name_prefix):
