@@ -203,17 +203,46 @@ class SingleGPUInferencePipeline:
     def prepare_pipeline(self, text_prompts: list, noise: torch.Tensor, 
                         current_start: int, current_end: int):
         """Prepare the pipeline for inference."""
-        # Use the original prepare method which now handles distributed environment gracefully
-        denoised_pred = self.pipeline.prepare(
-            text_prompts=text_prompts,
-            device=self.device,
-            dtype=torch.bfloat16,
-            block_mode='input',
-            noise=noise,
-            current_start=current_start,
-            current_end=current_end
-        )
-        return denoised_pred
+        if self.acceleration == "tensorrt":
+            # Prepare pipeline as usual to set up caches, etc.
+            self.pipeline.prepare(
+                text_prompts=text_prompts,
+                device=self.device,
+                dtype=torch.bfloat16,
+                block_mode='input',
+                noise=noise,
+                current_start=current_start,
+                current_end=current_end
+            )
+            # Prepare dummy input for engine (assuming single input for now)
+            # You may need to adapt this for your model's input signature
+            dummy_input = noise.cpu().numpy().astype(np.float16)
+            engine = self.engine_manager.get_or_build_engine(
+                builder=EngineBuilder(self.pipeline.generator.model, self.engine_dir),
+                dummy_inputs=(noise,),
+                name_prefix="generator",
+                opset=17,
+                force_export=False
+            )
+            # Prepare input dict for TRTInferenceWrapper
+            # This assumes a single input named 'input' (adapt as needed)
+            input_name = engine.input_names[0]
+            inputs_dict = {input_name: dummy_input}
+            outputs = engine.infer(inputs_dict)
+            # Convert output to torch tensor and move to device
+            denoised_pred = torch.from_numpy(outputs[0]).to(self.device)
+            return denoised_pred
+        else:
+            denoised_pred = self.pipeline.prepare(
+                text_prompts=text_prompts,
+                device=self.device,
+                dtype=torch.bfloat16,
+                block_mode='input',
+                noise=noise,
+                current_start=current_start,
+                current_end=current_end
+            )
+            return denoised_pred
     
     def run_inference(self, input_video_original: torch.Tensor, prompts: list, 
                      num_chuncks: int, chunck_size: int, noise_scale: float, 
