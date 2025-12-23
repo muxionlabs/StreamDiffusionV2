@@ -1,3 +1,12 @@
+
+# --- Set TensorRT export flag from CLI env var before any model import ---
+import os
+import sys
+if any(arg == "--acceleration" and sys.argv[i+1] == "tensorrt" for i, arg in enumerate(sys.argv) if arg == "--acceleration"):
+    os.environ["USE_TENSORRT_EXPORT"] = "1"
+else:
+    os.environ["USE_TENSORRT_EXPORT"] = "0"
+
 """
 Single GPU Inference Pipeline - Refactored from inference_pipe.py
 
