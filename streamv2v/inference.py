@@ -1,12 +1,3 @@
-
-# --- Set TensorRT export flag from CLI env var before any model import ---
-import os
-import sys
-if any(arg == "--acceleration" and sys.argv[i+1] == "tensorrt" for i, arg in enumerate(sys.argv) if arg == "--acceleration"):
-    os.environ["USE_TENSORRT_EXPORT"] = "1"
-else:
-    os.environ["USE_TENSORRT_EXPORT"] = "0"
-
 """
 Single GPU Inference Pipeline - Refactored from inference_pipe.py
 
@@ -19,10 +10,6 @@ inference pipeline on a single GPU:
 
 
 from causvid.models.wan.causal_stream_inference import CausalStreamInferencePipeline
-
-# --- TensorRT Acceleration Imports ---
-from streamv2v.acceleration.tensorrt.engine_manager import EngineManager
-from streamv2v.acceleration.tensorrt.builder import EngineBuilder
 from diffusers.utils import export_to_video
 from causvid.data import TextDataset
 from omegaconf import OmegaConf
@@ -108,35 +95,47 @@ def compute_noise_scale_and_step(input_video_original: torch.Tensor, end_idx: in
     return new_noise_scale, current_step
 
 class SingleGPUInferencePipeline:
-    def __init__(self, config, device: torch.device, acceleration="pytorch", engine_dir=None):
+    """
+    Single GPU Inference Pipeline Manager
+    
+    This class encapsulates the complete inference logic on a single GPU, 
+    including encoding, inference, and decoding.
+    """
+    
+    def __init__(self, config, device: torch.device):
+        """
+        Initialize the single GPU inference pipeline manager.
+        
+        Args:
+            config: Configuration object
+            device: GPU device
+        """
         self.config = config
         self.device = device
-        self.acceleration = acceleration
-        self.engine_dir = engine_dir
+        
+        # Setup logging
         self.logger = logging.getLogger("SingleGPUInference")
         self.logger.setLevel(logging.INFO)
+        # Prevent messages from propagating to the root logger (avoid double prints)
         self.logger.propagate = False
+        
         if not self.logger.handlers:
             handler = logging.StreamHandler()
             formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
             handler.setFormatter(formatter)
             self.logger.addHandler(handler)
-
-        # TensorRT engine manager
-        if self.acceleration == "tensorrt":
-            if self.engine_dir is None:
-                raise ValueError("engine_dir must be specified for TensorRT acceleration.")
-            self.engine_manager = EngineManager(self.engine_dir)
-        else:
-            self.engine_manager = None
-
+        
         # Initialize pipeline
         self.pipeline = CausalStreamInferencePipeline(config, device=str(device))
         self.pipeline.to(device=str(device), dtype=torch.bfloat16)
+        
+        # Performance tracking
         self.t_dit = 100.0
         self.t_total = 100.0
         self.processed = 0
-        self.logger.info(f"Single GPU inference pipeline manager initialized (acceleration: {self.acceleration})")
+
+        
+        self.logger.info("Single GPU inference pipeline manager initialized")
     
     def load_model(self, checkpoint_folder: str):
         """Load the model from checkpoint."""
@@ -169,66 +168,17 @@ class SingleGPUInferencePipeline:
     def prepare_pipeline(self, text_prompts: list, noise: torch.Tensor, 
                         current_start: int, current_end: int):
         """Prepare the pipeline for inference."""
-        if self.acceleration == "tensorrt":
-            # Prepare pipeline as usual to set up caches, etc.
-            self.pipeline.prepare(
-                text_prompts=text_prompts,
-                device=self.device,
-                dtype=torch.bfloat16,
-                block_mode='input',
-                noise=noise,
-                current_start=current_start,
-                current_end=current_end
-            )
-            # Prepare all required dummy inputs for ONNX export (noise, t, context, seq_len)
-            # Shapes must match what the model expects
-            # noise: [B, C, T, H, W] (already provided)
-            batch = noise.shape[0]
-            device = noise.device
-            # t: [B, T] (frame indices)
-            t = torch.arange(noise.shape[2], dtype=torch.long, device=device).unsqueeze(0).repeat(batch, 1)
-            # context: [B, context_len, context_dim] (dummy text embedding)
-            context_len = 77  # typical CLIP context length, adjust as needed
-            context_dim = 1024  # typical CLIP embedding dim, adjust as needed
-            context = torch.zeros((batch, context_len, context_dim), dtype=torch.float32, device=device)
-            # seq_len: int (sequence length)
-            seq_len = torch.tensor([noise.shape[2]], dtype=torch.long, device=device)
-            # Prepare all dummy inputs as PyTorch tensors for ONNX export
-            dummy_noise = noise.to(torch.float16)
-            dummy_t = t
-            dummy_context = context
-            dummy_seq_len = seq_len
-            dummy_inputs = (dummy_noise, dummy_t, dummy_context, dummy_seq_len)
-            engine = self.engine_manager.get_or_build_engine(
-                builder=EngineBuilder(self.pipeline.generator.model, self.engine_dir),
-                dummy_inputs=dummy_inputs,
-                name_prefix="generator",
-                opset=17,
-                force_export=False
-            )
-            # For inference, convert to numpy arrays
-            input_names = engine.input_names
-            inputs_dict = {
-                input_names[0]: dummy_noise.cpu().numpy(),
-                input_names[1]: dummy_t.cpu().numpy(),
-                input_names[2]: dummy_context.cpu().numpy(),
-                input_names[3]: dummy_seq_len.cpu().numpy(),
-            }
-            outputs = engine.infer(inputs_dict)
-            # Convert output to torch tensor and move to device
-            denoised_pred = torch.from_numpy(outputs[0]).to(self.device)
-            return denoised_pred
-        else:
-            denoised_pred = self.pipeline.prepare(
-                text_prompts=text_prompts,
-                device=self.device,
-                dtype=torch.bfloat16,
-                block_mode='input',
-                noise=noise,
-                current_start=current_start,
-                current_end=current_end
-            )
-            return denoised_pred
+        # Use the original prepare method which now handles distributed environment gracefully
+        denoised_pred = self.pipeline.prepare(
+            text_prompts=text_prompts,
+            device=self.device,
+            dtype=torch.bfloat16,
+            block_mode='input',
+            noise=noise,
+            current_start=current_start,
+            current_end=current_end
+        )
+        return denoised_pred
     
     def run_inference(self, input_video_original: torch.Tensor, prompts: list, 
                      num_chuncks: int, chunck_size: int, noise_scale: float, 
@@ -383,8 +333,6 @@ def main():
     parser.add_argument("--num_frames", type=int, default=81, help="Video length (number of frames)")
     parser.add_argument("--fixed_noise_scale", action="store_true", default=False)
     parser.add_argument("--img2img", action="store_true", default=False, help="Enable img2img mode: extract a single frame from img2vid output.")
-    parser.add_argument("--acceleration", type=str, default="pytorch", choices=["pytorch", "tensorrt"], help="Acceleration backend: pytorch or tensorrt")
-    parser.add_argument("--engine_dir", type=str, default=None, help="Directory for TensorRT engines (required if --acceleration tensorrt)")
     args = parser.parse_args()
     
     torch.set_grad_enabled(False)
@@ -438,17 +386,13 @@ def main():
         input_video_original = None
         t = args.num_frames
 
-    # Select acceleration backend
-    acceleration = args.acceleration
-    engine_dir = args.engine_dir
-
     # Optimized img2img path
     if args.image_path is not None and args.img2img:
         import os
         import numpy as np
         import imageio
         # --- Fast img2img: skip chunking, cache, and video logic ---
-        pipeline_manager = SingleGPUInferencePipeline(config, device, acceleration=acceleration, engine_dir=engine_dir)
+        pipeline_manager = SingleGPUInferencePipeline(config, device)
         pipeline_manager.load_model(args.checkpoint_folder)
         dataset = TextDataset(args.prompt_file_path)
         prompts = [dataset[0]]
@@ -499,7 +443,7 @@ def main():
         # Default: video or img2vid path
         chunck_size = 4
         num_chuncks = (t - 1) // chunck_size
-        pipeline_manager = SingleGPUInferencePipeline(config, device, acceleration=acceleration, engine_dir=engine_dir)
+        pipeline_manager = SingleGPUInferencePipeline(config, device)
         pipeline_manager.load_model(args.checkpoint_folder)
         dataset = TextDataset(args.prompt_file_path)
         prompts = [dataset[0]]
