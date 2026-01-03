@@ -1,8 +1,9 @@
 """
-Function: Exports Wan2.1 to ONNX.
-          1. USES UNIVERSAL MOCKS that accept *any* arguments (fixes TypeError).
-          2. Auto-detects 'k' vs 'k_cache' arguments.
-          3. Keeps CPU/FP32/Opset 14 for stability.
+Phase 1: The Wrapper & Export (Baked 480p Strategy)
+Function: Exports Wan2.1 to ONNX with FIXED 480p resolution.
+          1. Sets input size to exactly 832x480 (Latent: 104x60).
+          2. Avoids dynamic shape bugs by baking the target resolution.
+          3. Uses CPU to handle the large trace without VRAM OOM.
 """
 
 import sys
@@ -15,7 +16,7 @@ import torch.nn.functional as F
 from importlib.machinery import ModuleSpec
 
 # ==============================================================================
-#  1. THE MANUAL ATTENTION (CPU SAFE)
+#  1. MANUAL ATTENTION (CPU SAFE)
 # ==============================================================================
 def manual_attention_forward(q, k, v, **kwargs):
     # q, k, v: [Batch, Seq, Heads, Dim] -> Transpose to [Batch, Heads, Seq, Dim]
@@ -31,7 +32,7 @@ def manual_attention_forward(q, k, v, **kwargs):
     return output.transpose(1, 2)
 
 # ==============================================================================
-#  2. MOCK FLASH ATTENTION LIB (Universal Args)
+#  2. MOCK FLASH ATTENTION LIB
 # ==============================================================================
 mock_flash = types.ModuleType("flash_attn")
 mock_interface = types.ModuleType("flash_attn.flash_attn_interface")
@@ -42,27 +43,14 @@ mock_flash.__path__ = []
 mock_interface.__spec__ = ModuleSpec(name="flash_attn.flash_attn_interface", loader=None)
 mock_interface.__file__ = "mock_flash_interface.py"
 
-# --- THE UNIVERSAL MOCK ---
-# Accepts anything (*args, **kwargs) so it NEVER fails on signature mismatch
 def universal_mock(q, *args, **kwargs):
-    # Try to find K and V in kwargs
     k = kwargs.get('k') or kwargs.get('k_cache')
     v = kwargs.get('v') or kwargs.get('v_cache')
-    
-    # If not in kwargs, try positional args
     if k is None and len(args) > 0: k = args[0]
     if v is None and len(args) > 1: v = args[1]
-    
-    if k is None or v is None:
-        raise ValueError(f"Mock Error: Could not find 'k' or 'v' tensors. Args: {len(args)}, Kwargs: {kwargs.keys()}")
-
-    # Handle Variable Length case (3D tensors) by unsqueezing to 4D
-    if q.dim() == 3:
-        return manual_attention_forward(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)).squeeze(0)
-        
+    if q.dim() == 3: return manual_attention_forward(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)).squeeze(0)
     return manual_attention_forward(q, k, v)
 
-# Attach functions
 mock_flash.flash_attn_func = universal_mock
 mock_flash.flash_attn_varlen_func = universal_mock
 mock_flash.flash_attn_with_kvcache = universal_mock
@@ -71,11 +59,10 @@ mock_interface.flash_attn_varlen_func = universal_mock
 mock_interface.flash_attn_with_kvcache = universal_mock
 mock_flash.flash_attn_interface = mock_interface
 
-# Inject
 sys.modules["flash_attn"] = mock_flash
 sys.modules["flash_attn.flash_attn_interface"] = mock_interface
 
-print(">>> 🛡️ Flash Attention Lib intercepted (Universal Signature).")
+print(">>>Flash Attention Lib intercepted.")
 
 # ------------------------------------------------------------------------------
 # IMPORTS
@@ -125,19 +112,16 @@ def causal_rope_apply_trt(x, grid_sizes, freqs, start_frame=0):
     return torch.stack(output).type_as(x)
 
 def force_patch_model(model):
-    print(">>> 🔧 APPLYING LOGIC PATCHES...")
+    print(">>>APPLYING PATCHES...")
     for name, module in model.named_modules():
         if hasattr(module, 'freqs') and module.freqs.is_complex():
             real_freqs = torch.view_as_real(module.freqs).float().contiguous()
             del module.freqs
             module.register_buffer('freqs', real_freqs)
     causal_module.causal_rope_apply = causal_rope_apply_trt
-    
-    # Apply Universal Mock to the internal modules
     wan_attention_module.flash_attention = universal_mock
     wan_model_module.flash_attention = universal_mock
-    
-    print("       ✅ Internal flash_attention patched (Universal).")
+    print("Patches applied.")
 
 # ==============================================================================
 #  WRAPPER
@@ -210,28 +194,36 @@ def main():
     trt_wrapper = WanTRTWrapper(dit_model).to(device)
     trt_wrapper.eval()
 
-    print(">>> Generating TINY Dummy Tensors (64x64, 1 frame)...")
-    mini_x = torch.randn(1, 16, 1, 8, 14, device=device, dtype=torch.float32)
+    # --- KEY CHANGE: TARGET 480p SHAPES ---
+    # 832 / 8 = 104
+    # 480 / 8 = 60
+    # Latent Area = 6240
+    print(">>> Generating 480p Dummy Tensors (104x60 latents)...")
+    # x: [Batch, Channel, Time, Height, Width]
+    mini_x = torch.randn(1, 16, 1, 60, 104, device=device, dtype=torch.float32)
     mini_t = torch.tensor([[500, 500]], device=device, dtype=torch.long)
     mini_ctx = torch.randn(1, 512, 4096, device=device, dtype=torch.float32)
-    mini_kv = torch.randn(1, 30, 2048, 12, 256, device=device, dtype=torch.float32) 
+    # kv_cache: [Batch, Layers, SeqLen, Heads, HeadDim]
+    # SeqLen = Time * H * W = 1 * 60 * 104 = 6240
+    mini_kv = torch.randn(1, 30, 6240, 12, 256, device=device, dtype=torch.float32) 
     mini_cross = torch.randn(1, 30, 512, 12, 256, device=device, dtype=torch.float32)
 
     print(">>> Cleaning RAM...")
     del pipeline_manager
     gc.collect()
 
+    # Only define DYNAMIC BATCH, NOT dynamic spatial dims
     dynamic_axes = {
-        "x": {0: "batch", 2: "time", 3: "height", 4: "width"},
+        "x": {0: "batch", 2: "time"}, # Fixed H/W
         "t": {0: "batch"},
         "context": {0: "batch"},
-        "kv_cache": {0: "batch", 2: "seq_len_cache"},
+        "kv_cache": {0: "batch"}, # Fixed SeqLen
         "cross_cache": {0: "batch"},
-        "flow_output": {0: "batch", 2: "time", 3: "height", 4: "width"},
-        "kv_cache_updated": {0: "batch", 2: "seq_len_cache"}
+        "flow_output": {0: "batch", 2: "time"},
+        "kv_cache_updated": {0: "batch"}
     }
 
-    print(f">>> Exporting to {args.output_onnx} (CPU / OPSET 14)...")
+    print(f">>> Exporting to {args.output_onnx} (CPU / 480p FIXED)...")
     
     torch.onnx.export(
         trt_wrapper,
@@ -248,7 +240,7 @@ def main():
         verbose=False
     )
     
-    print(f">>> ✅ ONNX Export Complete! Check for {args.output_onnx}")
+    print(f">>>ONNX Export Complete! Check for {args.output_onnx}")
 
 if __name__ == "__main__":
     main()
