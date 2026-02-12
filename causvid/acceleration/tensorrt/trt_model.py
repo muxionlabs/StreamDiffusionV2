@@ -139,6 +139,10 @@ def trt_rope_apply(
     # Apply rotation to the valid portion of x[0] (batch index 0)
     # x shape: [B, S, N, D]
     x_valid = x[0, :seq_len]  # [seq_len, N, D]
+    orig_dtype = x_valid.dtype
+    
+    # Upcast to float32 for precision (original uses float64 complex multiply)
+    x_valid = x_valid.float()
     
     # Split into pairs for rotation: [seq_len, N, half_d, 2]
     x_pairs = x_valid.reshape(seq_len, N, half_d, 2)
@@ -146,14 +150,17 @@ def trt_rope_apply(
     x_odd = x_pairs[..., 1]   # [seq_len, N, half_d]
     
     # Rotary embedding: (x_even * cos - x_odd * sin, x_even * sin + x_odd * cos)
-    cos_all = cos_all.to(x.dtype)
-    sin_all = sin_all.to(x.dtype)
+    cos_all = cos_all.float()
+    sin_all = sin_all.float()
     
     out_even = x_even * cos_all - x_odd * sin_all
     out_odd = x_even * sin_all + x_odd * cos_all
     
     # Interleave back: [seq_len, N, half_d, 2] -> [seq_len, N, D]
     out = torch.stack([out_even, out_odd], dim=-1).reshape(seq_len, N, D)
+    
+    # Cast back to original dtype
+    out = out.to(orig_dtype)
     
     # Place back into full sequence (padding stays unchanged)
     result = x.clone()
