@@ -569,7 +569,7 @@ class TRTCausalWanModel(nn.Module):
         text_len=512,
         in_dim=16,
         dim=1536,
-        ffn_dim=3840,
+        ffn_dim=8960,
         freq_dim=256,
         text_dim=4096,
         out_dim=16,
