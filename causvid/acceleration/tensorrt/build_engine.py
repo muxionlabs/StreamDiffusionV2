@@ -163,9 +163,9 @@ def build_engine(
     # Save engine
     os.makedirs(os.path.dirname(engine_path) or '.', exist_ok=True)
     with open(engine_path, 'wb') as f:
-        f.write(serialized_engine)
+        f.write(bytes(serialized_engine))
     
-    engine_size_mb = len(serialized_engine) / (1 << 20)
+    engine_size_mb = serialized_engine.nbytes / (1 << 20)
     logger.info(f"Engine saved: {engine_path} ({engine_size_mb:.1f} MB)")
     
     # Save engine metadata
