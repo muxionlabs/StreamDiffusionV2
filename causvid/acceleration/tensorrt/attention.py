@@ -90,35 +90,44 @@ def trt_rope_apply(x: torch.Tensor, grid_sizes: torch.Tensor, freqs: torch.Tenso
         # grid_sizes is [B, 3], so grid_sizes[i] is [3]
         f, h, w = torch.unbind(grid_sizes[i], dim=0)
         
-        # Calculate seq len symbolically
-        # Note: We cast to int for slicing, but slicing with specialized tensors usually works in TRT dynamic shapes
-        # However, for looping in Python, we need values.
-        # But here we are tracing.
-        # Ideally, we used batch-aware ops, but loop is fine if B is small (1).
+        # Int64 for Shapes (ONNX Requirement) - Force cast to be sure
+        f, h, w = f.long(), h.long(), w.long()
         
-        # For tracing, slicing with tensor variables can be tricky.
-        # But converting to int (.item()) BAKES the value.
-        # We must keep it as tensor if possible, or assume it matches.
+        # Int32 for Math (TRT Overflow Prevention)
+        f_int, h_int, w_int = f.int(), h.int(), w.int()
+        actual_seq_len = f_int * h_int * w_int
         
-        # ACTUALLY: For TRT + ONNX, if we loop over B, and B is known (optimization profile), it unrolls.
-        # But 'f', 'h', 'w' MUST be tensors to be dynamic.
-        # If we slice x[i, :f*h*w], PyTorch ONNX exporter handles dynamic slice.
-        
-        actual_seq_len = f * h * w
+        # Shape arg must be Int64 to match other dims in reshape
+        actual_seq_len_64 = actual_seq_len.long()
         
         # Get the relevant portion
-        # We use dynamic slicing
+        # Slicing works with Int32 or Int64
         x_i = x[i, :actual_seq_len].float()  # [seq, n, d]
         
         # Build frequency tensor for this sample
-        freqs_f = freqs_split[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1)
-        freqs_h = freqs_split[1][:h].view(1, h, 1, -1).expand(f, h, w, -1)
-        freqs_w = freqs_split[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        freqs_i = torch.cat([freqs_f, freqs_h, freqs_w], dim=-1).reshape(actual_seq_len, 1, -1)  # [seq, 1, half_d]
+        # Define shape constants as Long Tensors (for view)
+        one_t = torch.tensor(1, device=x.device, dtype=torch.long)
+        
+        # Calculate split sizes explicitly
+        d_split_0 = half_d - 2 * (half_d // 3)
+        d_split_1 = half_d // 3
+        d_split_2 = half_d // 3
+        
+        d0_t = torch.tensor(d_split_0, device=x.device, dtype=torch.long)
+        d1_t = torch.tensor(d_split_1, device=x.device, dtype=torch.long)
+        d2_t = torch.tensor(d_split_2, device=x.device, dtype=torch.long)
+        half_d_t = torch.tensor(half_d, device=x.device, dtype=torch.long)
+        
+        # Use Int64 (f, h, w) for view/expand shapes
+        # Use explicit split dims
+        freqs_f = freqs_split[0][:f].view(f, one_t, one_t, d0_t).expand(f, h, w, d0_t)
+        freqs_h = freqs_split[1][:h].view(one_t, h, one_t, d1_t).expand(f, h, w, d1_t)
+        freqs_w = freqs_split[2][:w].view(one_t, one_t, w, d2_t).expand(f, h, w, d2_t)
+        
+        # Reshape uses Int64 dims: [Actual(64), 1(64), HalfD(64)]
+        freqs_i = torch.cat([freqs_f, freqs_h, freqs_w], dim=-1).reshape(actual_seq_len_64, one_t, half_d_t)  # [seq, 1, half_d]
         
         # Real-number rotary embedding (avoid complex numbers for ONNX)
-        # CORRECTION: WanModel uses adjacent pairs (view_as_complex on last dim)
-        # So Real = x[0::2], Imag = x[1::2]
         x_real = x_i[..., 0::2]
         x_imag = x_i[..., 1::2]
         
@@ -132,10 +141,12 @@ def trt_rope_apply(x: torch.Tensor, grid_sizes: torch.Tensor, freqs: torch.Tenso
         out_imag = x_real * sin_freqs + x_imag * cos_freqs
         
         # Interleave back: stack on last dim then flatten
-        # Stack: [seq, n, half_d, 2] -> Flatten: [seq, n, d]
-        # Use simple operations to avoid TRT shape overflow
         x_rotated = torch.cat([out_real.unsqueeze(-1), out_imag.unsqueeze(-1)], dim=-1)
-        x_rotated = x_rotated.reshape(x_rotated.shape[:-2] + (d,))
+        d_t = torch.tensor(d, device=x.device, dtype=torch.long)
+        n_t = torch.tensor(n, device=x.device, dtype=torch.long)
+        # Using -1 for inferred dims is safer 
+        # Reshape uses Int64 dims: [Actual(64), N(64), D(64)]
+        x_rotated = x_rotated.reshape(actual_seq_len_64, n_t, d_t)
         
         # Handle padding
         if actual_seq_len < seq_len:
@@ -176,48 +187,80 @@ def trt_causal_rope_apply(
     output = []
     for i in range(b):
         f, h, w = torch.unbind(grid_sizes[i], dim=0)
+        # Cast to Int32 for shape operations consistent with TRT 10
+        f, h, w = f.int(), h.int(), w.int()
         actual_seq_len = f * h * w
         
         # start_frame should be tensor
-        sf = start_frame[i]
+        sf = start_frame[i].int()
+    for i in range(b):
+        f, h, w = torch.unbind(grid_sizes[i], dim=0)
         
-        # Casting to int for Slicing indices:
-        # If we use tensors for slicing: freqs[sf:sf+f]
-        # PyTorch supports this in export.
+        # Int64 for Shapes (ONNX Requirement) - Force cast
+        f, h, w = f.long(), h.long(), w.long()
         
+        # Int32 for Math (TRT Overflow Prevention 64-bit)
+        f_int, h_int, w_int = f.int(), h.int(), w.int()
+        actual_seq_len = f_int * h_int * w_int
+        
+        # Cast back to Long for Reshape args
+        actual_seq_len_64 = actual_seq_len.long()
+        
+        # start_frame indices need Int32 for calculation
+        sf = start_frame[i].int()
+        
+        # Slicing works with Int32 or Int64
         x_i = x[i, :actual_seq_len].float()  # [seq, n, d]
         
         # Build frequency tensor with offset
         # Use explicit dynamic indexing to prevent constant folding of 'sf'
-        idx_f = torch.arange(f, device=x.device) + sf
-        # freq_max must be a python int or tensor on same device
+        idx_f = torch.arange(f_int, device=x.device) + sf
         freq_max = int(freqs_split[0].shape[0]) - 1
-        idx_f = idx_f.long().clamp(max=freq_max) 
+        idx_f = idx_f.int().clamp(max=freq_max) 
         
-        freqs_f = freqs_split[0][idx_f].view(f, 1, 1, -1).expand(f, h, w, -1)
-        freqs_h = freqs_split[1][:h].view(1, h, 1, -1).expand(f, h, w, -1)
-        freqs_w = freqs_split[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        freqs_i = torch.cat([freqs_f, freqs_h, freqs_w], dim=-1).reshape(actual_seq_len, 1, -1)  # [seq, 1, half_d]
+        # Define shape constants as Long Tensors (for view)
+        one_t = torch.tensor(1, device=x.device, dtype=torch.long)
         
-        # Real-number rotary embedding (avoid complex numbers for ONNX)
-        # CORRECTION: WanModel uses adjacent pairs (view_as_complex on last dim)
+        # Calculate split sizes explicitly
+        # freq_splits = [half_d - 2 * (half_d // 3), half_d // 3, half_d // 3]
+        d_split_0 = half_d - 2 * (half_d // 3)
+        d_split_1 = half_d // 3
+        d_split_2 = half_d // 3
+        
+        d0_t = torch.tensor(d_split_0, device=x.device, dtype=torch.long)
+        d1_t = torch.tensor(d_split_1, device=x.device, dtype=torch.long)
+        d2_t = torch.tensor(d_split_2, device=x.device, dtype=torch.long)
+        half_d_t = torch.tensor(half_d, device=x.device, dtype=torch.long)
+        
+        # Use Int64 (f, h, w) for view/expand shapes
+        # Use explicit split dims
+        freqs_f = freqs_split[0][idx_f].view(f, one_t, one_t, d0_t).expand(f, h, w, d0_t)
+        freqs_h = freqs_split[1][:h].view(one_t, h, one_t, d1_t).expand(f, h, w, d1_t)
+        freqs_w = freqs_split[2][:w].view(one_t, one_t, w, d2_t).expand(f, h, w, d2_t)
+        
+        # Reshape uses Int64 dims: [Actual(64), 1(64), HalfD(64)]
+        freqs_i = torch.cat([freqs_f, freqs_h, freqs_w], dim=-1).reshape(actual_seq_len_64, one_t, half_d_t)
+        
+        # Real-number rotary embedding
         x_real = x_i[..., 0::2]
         x_imag = x_i[..., 1::2]
         
         cos_freqs = freqs_i.cos().expand(-1, n, -1)
         sin_freqs = freqs_i.sin().expand(-1, n, -1)
         
-        # Rotate
         out_real = x_real * cos_freqs - x_imag * sin_freqs
         out_imag = x_real * sin_freqs + x_imag * cos_freqs
         
-        # Interleave back
         x_rotated = torch.cat([out_real.unsqueeze(-1), out_imag.unsqueeze(-1)], dim=-1)
-        x_rotated = x_rotated.reshape(x_rotated.shape[:-2] + (d,))
+        d_t = torch.tensor(d, device=x.device, dtype=torch.long)
+        n_t = torch.tensor(n, device=x.device, dtype=torch.long)
+        # Using -1 for inferred dims is safer 
+        # Reshape uses Int64 dims: [Actual(64), N(64), D(64)]
+        x_rotated = x_rotated.reshape(actual_seq_len_64, n_t, d_t)
         
         if actual_seq_len < seq_len:
             x_rotated = torch.cat([x_rotated, x[i, actual_seq_len:].float()], dim=0)
-        
+            
         output.append(x_rotated)
     
     return torch.stack(output).type_as(x)
@@ -297,10 +340,20 @@ class TRTCausalSelfAttention(nn.Module):
         
         # Compute Q, K, V
         # Compute Q, K, V
-        # Use -1 for sequence length to ensure dynamic reshaping in ONNX
-        q = self.norm_q(self.q(x)).view(b, -1, n, d)
-        k = self.norm_k(self.k(x)).view(b, -1, n, d)
-        v = self.v(x).view(b, -1, n, d)
+        # Compute Q, K, V
+        # Compute Q, K, V
+        # shape_64 uses python ints b, n, d directly
+        # No intermediate Int32 tensors needed for this part
+        # Explicit Shape Construction
+        # Use Int64 for Reshape (Standard ONNX/TRT requirement)
+        # Avoid implicit 'view' to control types precisely
+        # Use explicit 's' instead of -1 to avoid TRT Shape Overflow
+        shape_64 = torch.tensor([b, s, n, d], device=x.device, dtype=torch.long)
+        resh_dims = torch.unbind(shape_64)
+        
+        q = self.norm_q(self.q(x)).reshape(*resh_dims)
+        k = self.norm_k(self.k(x)).reshape(*resh_dims)
+        v = self.v(x).reshape(*resh_dims)
         
         # Apply RoPE
         if kv_cache_k is None:
@@ -311,11 +364,15 @@ class TRTCausalSelfAttention(nn.Module):
             # Streaming: offset RoPE based on current position
             # Ensure frame_seqlen is tensor
             grid_i = grid_sizes[0] # Assume B=1 or same grid
-            frame_seqlen = grid_i[1] * grid_i[2]
+            
+            # Use Int32 for arithmetic safety
+            f_g, h_g, w_g = grid_i[0].int(), grid_i[1].int(), grid_i[2].int()
+            frame_seqlen = f_g * h_g * w_g
             
             # Symbolic division
             if start_frame is None and current_start is not None:
-                start_frame = current_start // frame_seqlen
+                # Floor division of Int32 tensors
+                start_frame = torch.div(current_start.int(), frame_seqlen, rounding_mode='floor')
                 
             q = trt_causal_rope_apply(q, grid_sizes, freqs, start_frame)
             k = trt_causal_rope_apply(k, grid_sizes, freqs, start_frame)
@@ -339,16 +396,16 @@ class TRTCausalSelfAttention(nn.Module):
                 # New K/V are [B, S, H, D]
                 # Cache is [B, MaxLen, H, D]
                 
-                # Handling batch loop purely with tensors is tricky for scatter if B > 1 and starts differ
                 # But we can iterate B since it is a loop in graph (or unrolled if small)
                 for i in range(b):
                     # Get start as tensor (0-d or 1-d)
-                    start_t = current_start[i] 
-                    idx = torch.arange(s, device=x.device) + start_t
+                    # Force Int32 for indexing
+                    start_t = current_start[i].int()
+                    idx = torch.arange(s, device=x.device, dtype=torch.int32) + start_t
                     
                     # Ensure indices are within bounds (clamp or mask)
                     # For streaming, we assume caller manages logic, but let's be safe for tracing
-                    max_len = new_kv_cache_k.shape[1]
+                    max_len = int(new_kv_cache_k.shape[1])
                     mask = idx < max_len
                     valid_idx = idx[mask]
                     
@@ -358,8 +415,11 @@ class TRTCausalSelfAttention(nn.Module):
                         valid_src = k[i, :valid_idx.numel()]
                         
                         # Use index_put_ or simple indexing which traces to Scatter/IndexPut
-                        new_kv_cache_k[i, valid_idx] = valid_src
-                        new_kv_cache_v[i, valid_idx] = v[i, :valid_idx.numel()]
+                        # Indices must be Long for pytorch indexing, but TRT handles Int32 better for shape calc?
+                        # Actually, PyTorch indexing requires Long. 
+                        # But if we compute in Int32 and cast to Long at valid_idx usage...
+                        new_kv_cache_k[i, valid_idx.long()] = valid_src
+                        new_kv_cache_v[i, valid_idx.long()] = v[i, :valid_idx.numel()]
                 
                 # Define end_idx for slicing the full cache for attention
                 # We use max() to handle batching, though usually B=1
@@ -382,6 +442,8 @@ class TRTCausalSelfAttention(nn.Module):
             new_kv_cache_v = None
         
         # Reshape for attention: [B, num_heads, L, head_dim]
+        # Reshape for attention: [B, num_heads, L, head_dim]
+        # STRICT INT32 STRATEGY
         q = q.transpose(1, 2)
         k_full = k_full.transpose(1, 2)
         v_full = v_full.transpose(1, 2)
@@ -397,95 +459,140 @@ class TRTCausalSelfAttention(nn.Module):
         # - Default: Attend to everything (History is valid)
         # - Constraint: Within the current chunk (Physical: current_start...current_start+s), enforces causality.
         
-        attn_mask = None
-        if s > 1 and kv_cache_k is not None and current_start is not None:
-            # Construct dynamic mask
-            # Shape: [B, 1, s, Total_K] -> Broadcast over heads
+        # CHUNKED ATTENTION STRATEGY
+        # The attention mask [B, 1, s, total_k] can exceed Int32 limit (2.14B)
+        # e.g., s=100k, total_k=24k -> 2.4 Billion -> TRT Shape Overflow
+        # We split 's' into chunks to keep mask size safe.
+        
+        CHUNK_SIZE = 4096
+        
+        if s > CHUNK_SIZE and kv_cache_k is not None:
+            # Chunked execution
+            out_chunks = []
             total_k = k_full.shape[2]
             
-            # Start with all True (Attend to everything)
-            # Use float mask for TRT compatibility often? boolean is fine for SDPA.
-            # We use float -inf for masked, 0 for allowed if additive?
-            # SDPA supports boolean: True = attend, False = mask.
+            # Common constants for mask generation
             
-            # Apply Causal constraint to the current writing block
-            # USE TENSOR INDEXING to prevent constant folding
-            c_start = current_start[0] # Tensor scalar-like
-            c_end = c_start + s
+            # Use Int32 for indices
+            col_indices = torch.arange(total_k, device=q.device, dtype=torch.int32).reshape(1, 1, 1, total_k)
             
-            # We must use tensor-based masking
-            # Create indices [0...Total_K]
-            col_indices = torch.arange(total_k, device=q.device).view(1, 1, 1, total_k)
+            if current_start is not None:
+                c_start = current_start[0]
+                c_end = c_start + s
+                
+                # Expand dims for broadcasting
+                c_start_exp = c_start.reshape(1, 1, 1, 1)
+                c_end_exp = c_end.reshape(1, 1, 1, 1)
+                
+                # Valid End Logic
+                f_g, h_g, w_g = torch.unbind(grid_sizes[0], dim=0)
+                frame_len = (f_g.int() * h_g.int() * w_g.int())
+                sf_val = start_frame[0].int()
+                logical_valid = (sf_val * frame_len) + s
+                total_k_t = torch.tensor([total_k], device=q.device, dtype=torch.int32)
+                valid_end = torch.min(logical_valid, total_k_t)
+                valid_end_exp = valid_end.reshape(1, 1, 1, 1)
             
-            # 1. Intra-chunk causality: mask [c_start : c_end] with tril
-            # This is hard to do with pure vector logic without scattering.
-            # But the local_causal pattern is static shape (s, s).
-            # We can use previous logic IF slice assignment supports tensor indices?
-            # Assigning to mask[:, :, :, c_start:c_end] works if c_start is int.
-            # If c_start is tensor, we need:
-            # mask.index_put_((slice(None), slice(None), slice(None), range_tensor), local_causal)
-            # Range tensor:
-            range_tensor = torch.arange(s, device=q.device) + c_start
+            # Loop over query chunks
+            for i in range(0, s, CHUNK_SIZE):
+                q_chunk = q[:, :, i:i+CHUNK_SIZE, :]
+                chunk_len = q_chunk.shape[2]
+                
+                attn_mask_chunk = None
+                
+                if current_start is not None:
+                    # Generate mask for this chunk
+                    # row_indices must be offset by 'i'
+                    row_indices = torch.arange(chunk_len, device=q.device, dtype=torch.int32).reshape(1, 1, chunk_len, 1) + i
+                    
+                    # --- Mask Logic Reused ---
+                    # 1. Intra-Chunk Future Block
+                    is_in_current_block = (col_indices >= c_start_exp) & (col_indices < c_end_exp)
+                    is_future_in_block = col_indices > (c_start_exp + row_indices)
+                    mask_intra_future = is_in_current_block & is_future_in_block
+                    
+                    # 2. Uninitialized Memory
+                    mask_uninitialized = col_indices >= valid_end_exp
+                    
+                    # 3. Combine
+                    mask_block = mask_intra_future | mask_uninitialized
+                    # Convert to float mask for better TRT stability
+                    attn_mask_chunk = torch.zeros(mask_block.shape, device=q.device, dtype=q.dtype)
+                    attn_mask_chunk.masked_fill_(mask_block, float('-inf'))
+                    
+                elif causal_mask is not None:
+                    # Static fallback (sliced for chunk)
+                    attn_mask_chunk = causal_mask[i:i+chunk_len, :total_k]
+                
+                # Run SDPA for chunk
+                # Ensure mask is matching dtype
+                if attn_mask_chunk is not None and attn_mask_chunk.dtype != q.dtype:
+                    attn_mask_chunk = attn_mask_chunk.to(q.dtype)
+                    
+                o_chunk = F.scaled_dot_product_attention(
+                    q_chunk, k_full, v_full,
+                    attn_mask=attn_mask_chunk,
+                    dropout_p=0.0,
+                    is_causal=False
+                )
+                out_chunks.append(o_chunk)
             
-            # Clamp range to be safe (though it should fit)
-            max_val = torch.tensor(total_k - 1, device=q.device, dtype=torch.long)
-            range_tensor = range_tensor.clamp(max=max_val)
+            out = torch.cat(out_chunks, dim=2)
             
-            # Create expansion of local_causal to match mask dims?
-            # We need to scatter the local_causal into the big mask.
-            # TRT doesn't love scatter.
-            # Alternative: Construct mask analytically.
-            # A position (i, j) in (s, total_k) is ALLOWED if:
-            #   (j < c_start) OR (j >= c_start AND j < c_end AND j <= (c_start + i))
-            #   AND j < valid_end
-            
-            # Row indices [0...s]
-            row_indices = torch.arange(s, device=q.device).view(1, 1, s, 1)
-            
-            # Condition 1: History (j < c_start) -> True
-            cond_history = col_indices < c_start.view(1, 1, 1, 1)
-            
-            # Condition 2: Intra-chunk (c_start <= j < c_end AND j <= c_start + i)
-            # j relative to chunk start: j_rel = j - c_start
-            cond_intra_range = (col_indices >= c_start.view(1, 1, 1, 1)) & (col_indices < c_end.view(1, 1, 1, 1))
-            cond_causal = col_indices <= (c_start.view(1, 1, 1, 1) + row_indices)
-            cond_intra = cond_intra_range & cond_causal
-            
-            # Initial Allowed Mask (History + Intra-Causal)
-            mask = cond_history | cond_intra
-            
-            # Condition 3: Valid Memory (Optimization for Zeros)
-            # Check for valid usage of Ring Buffer
-            f_g, h_g, w_g = torch.unbind(grid_sizes[0], dim=0)
-            frame_len = f_g * h_g * w_g
-            
-            sf_val = start_frame[0] # Tensor
-            logical_valid = (sf_val * frame_len) + s # Tensor
-            
-            # valid_end = min(logical_valid, total_k)
-            valid_end = torch.min(logical_valid, torch.tensor(total_k, device=q.device))
-            
-            cond_valid = col_indices < valid_end.view(1, 1, 1, 1)
-            
-            # Final Mask = (History OR Intra) AND Valid_Memory
-            mask = mask & cond_valid
-            
-            attn_mask = mask
-        elif causal_mask is not None:
-            # Fallback for non-streaming / static cases
-            attn_mask = causal_mask[:s, :k_full.shape[2]]
-
-        out = F.scaled_dot_product_attention(
-            q, k_full, v_full,
-            attn_mask=attn_mask,
-            dropout_p=0.0,
-            is_causal=False
-        )
+        else:
+            # Standard single-pass execution (retains original logic logic for small s)
+            attn_mask = None
+            if s > 1 and kv_cache_k is not None and current_start is not None:
+                # Construct dynamic mask
+                # Shape: [B, 1, s, Total_K] -> Broadcast over heads
+                total_k = k_full.shape[2]
+                
+                # APPLY ORIGINAL MASK LOGIC
+                c_start = current_start[0] # Tensor scalar-like
+                c_end = c_start + s
+                
+                col_indices = torch.arange(total_k, device=q.device, dtype=torch.int32).reshape(1, 1, 1, total_k)
+                row_indices = torch.arange(s, device=q.device, dtype=torch.int32).reshape(1, 1, s, 1)
+                
+                # Valid End
+                f_g, h_g, w_g = torch.unbind(grid_sizes[0], dim=0)
+                frame_len = (f_g.int() * h_g.int() * w_g.int()) 
+                sf_val = start_frame[0].int() 
+                logical_valid = (sf_val * frame_len) + s 
+                total_k_t = torch.tensor([total_k], device=q.device, dtype=torch.int32)
+                valid_end = torch.min(logical_valid, total_k_t)
+                
+                # Intra-Chunk Causal + Uninitialized
+                c_start_exp = c_start.reshape(1, 1, 1, 1)
+                c_end_exp = c_end.reshape(1, 1, 1, 1)
+                valid_end_exp = valid_end.reshape(1, 1, 1, 1)
+                
+                is_in_current_block = (col_indices >= c_start_exp) & (col_indices < c_end_exp)
+                is_future_in_block = col_indices > (c_start_exp + row_indices)
+                mask_intra_future = is_in_current_block & is_future_in_block
+                
+                mask_uninitialized = col_indices >= valid_end_exp
+                
+                mask_block = mask_intra_future | mask_uninitialized
+                
+                # Use float mask
+                attn_mask = torch.zeros(mask_block.shape, device=q.device, dtype=q.dtype)
+                attn_mask.masked_fill_(mask_block, float('-inf'))
+                
+            elif causal_mask is not None:
+                 attn_mask = causal_mask[:s, :k_full.shape[2]]
+    
+            out = F.scaled_dot_product_attention(
+                q, k_full, v_full,
+                attn_mask=attn_mask,
+                dropout_p=0.0,
+                is_causal=False
+            )
         
         # Reshape back: [B, L, C]
         # Reshape back: [B, L, C]
-        # Use -1 for sequence length
-        out = out.transpose(1, 2).contiguous().view(b, -1, self.dim)
+        # Use explicit self.dim for sequence length
+        out = out.transpose(1, 2).reshape(b, s, self.dim)
         out = self.o(out)
         
         return out, new_kv_cache_k, new_kv_cache_v
@@ -542,27 +649,46 @@ class TRTCrossAttention(nn.Module):
         b, s, _ = x.shape
         n, d = self.num_heads, self.head_dim
         
-        q = self.norm_q(self.q(x)).view(b, s, n, d)
+        q = self.norm_q(self.q(x)).reshape(b, s, n, d)
         
         # Use cache if available, otherwise compute K, V
         if crossattn_cache_k is not None and crossattn_cache_v is not None:
             k = crossattn_cache_k
             v = crossattn_cache_v
         else:
-            k = self.norm_k(self.k(context)).view(b, -1, n, d)
-            v = self.v(context).view(b, -1, n, d)
+            # Explicit views to avoid TRT overflow
+            # Use Int64 for shape construction
+            ctx_len = context.shape[1]
+            shape_64 = torch.tensor([b, ctx_len, n, d], device=x.device, dtype=torch.long)
+            resh_dims = torch.unbind(shape_64)
+            
+            k = self.norm_k(self.k(context)).reshape(*resh_dims)
+            v = self.v(context).reshape(*resh_dims)
         
         # Transpose for attention
         q = q.transpose(1, 2)  # [B, n, s, d]
         k = k.transpose(1, 2)  # [B, n, ctx_len, d]
         v = v.transpose(1, 2)  # [B, n, ctx_len, d]
         
-        # SDPA
-        out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
+        # CHUNKED ATTENTION FOR CROSS-ATTN
+        # Logits size: S * Ctx * Heads = 99840 * 4096 * 12 = 4.9 Billion -> Overflow Int32
+        CHUNK_SIZE = 4096
         
-        # Reshape back
-        # Reshape back
-        out = out.transpose(1, 2).contiguous().view(b, -1, self.dim)
+        if s > CHUNK_SIZE:
+             out_chunks = []
+             for i in range(0, s, CHUNK_SIZE):
+                 q_chunk = q[:, :, i:i+CHUNK_SIZE, :]
+                 # SDPA
+                 o_chunk = F.scaled_dot_product_attention(q_chunk, k, v, dropout_p=0.0)
+                 out_chunks.append(o_chunk)
+             
+             out = torch.cat(out_chunks, dim=2)
+        else:
+             # SDPA
+             out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
+        
+        # Reshape back to [B, s, dim] explicitly
+        out = out.transpose(1, 2).reshape(b, s, self.dim)
         out = self.o(out)
         
         # Return with cache (transposed back)

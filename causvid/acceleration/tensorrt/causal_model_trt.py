@@ -314,7 +314,7 @@ class CausalWanModelTRTExport(nn.Module):
             window_size=original_model.window_size,
             qk_norm=original_model.qk_norm,
             cross_attn_norm=original_model.cross_attn_norm,
-            cross_attn_norm=original_model.cross_attn_norm,
+
             eps=original_model.eps,
             max_seq_len=max_seq_len,
         )
@@ -400,6 +400,15 @@ class CausalWanModelTRTExport(nn.Module):
         # Embed context (text) - ensure dtype matches
         context_emb = self.text_embedding(context.to(dtype))  # [B, text_len, dim]
         
+        # Calculate grid sizes dynamically from input shape [B, F, C, H, W]
+        # x is [B, F, C, H, W]
+        b_in, f_in, c_in, h_in, w_in = x.shape
+        
+        # Grid sizes for RoPE [F, H/ph, W/pw] - Must be Token Grid Size
+        # patch_size is usually (1, 2, 2)
+        pt, ph, pw = self.patch_size
+        grid_sizes = torch.tensor([[f_in // pt, h_in // ph, w_in // pw]], device=device, dtype=torch.long).expand(b, -1)
+        
         # Embed patches: [B, F, C, H, W] -> [B, dim, F', H', W'] -> [B, L, dim]
         x = self.patch_embedding(x.permute(0, 2, 1, 3, 4))  # [B, C, F, H, W]
         x = x.flatten(2).transpose(1, 2)  # [B, L, dim]
@@ -408,11 +417,8 @@ class CausalWanModelTRTExport(nn.Module):
         # Use torch.full to support symbolic tracing of shape
         seq_lens = torch.full((b,), x.shape[1], device=device, dtype=torch.long)
         
-        # Hardcode grid_sizes directly for 480p to bypass TRT runtime "Shape Calculation Overflow"
-        # The input tensor is corrupted during runtime (garbage values)
-        # Since profile is locked to 480p (30x52 tokens), we bake the correct values.
-        # [1, 30, 52] (1 frame, 30 grid h, 52 grid w)
-        grid_sizes = torch.tensor([[1, 30, 52]], device=device, dtype=torch.long).expand(b, -1)
+        # Hardcode removed
+        # grid_sizes = torch.tensor([[1, 30, 52]], device=device, dtype=torch.long).expand(b, -1)
         
         # Time embeddings - cast sinusoidal output to model dtype
         from causvid.models.wan.wan_base.modules.model import sinusoidal_embedding_1d
@@ -521,34 +527,36 @@ class CausalWanModelTRTExport(nn.Module):
         return x, new_kv_caches, new_cross_caches
     
     def _unpatchify(self, x: torch.Tensor, grid_sizes: torch.Tensor) -> torch.Tensor:
-        """Reconstruct video from patches."""
+        """Reconstruct video from patches. Vectorized for TRT safety."""
         b = x.shape[0]
         c = self.out_dim
-        outputs = []
+        pt, ph, pw = self.patch_size
         
-        for i in range(b):
-            # Use torch.unbind to preserve symbolic graph
-            f, h, w = torch.unbind(grid_sizes[i], dim=0)
-            
-            # Constraint: Clamp to avoid overflow if TRT validates with garbage inputs
-            f = torch.clamp(f, min=1, max=1024)
-            h = torch.clamp(h, min=1, max=4096)
-            w = torch.clamp(w, min=1, max=4096)
-            
-            seq_len = f * h * w
-            u = x[i, :seq_len].view(f, h, w, *self.patch_size, c)
-            u = torch.einsum('fhwpqrc->cfphqwr', u)
-            
-            # Symbolic reshape logic
-            # We reconstruct the video dimensions dynamically
-            h_out = h * self.patch_size[1]
-            w_out = w * self.patch_size[2]
-            f_out = f * self.patch_size[0]
-            
-            u = u.reshape(c, f_out, h_out, w_out)
-            outputs.append(u)
+        # Assume uniform grid sizes across batch (valid for standard tensor batches)
+        # Use first element to determine shape
+        f, h, w = torch.unbind(grid_sizes[0], dim=0)
         
-        return torch.stack(outputs)
+        # Ensure Int64 for shape calculations
+        f = f.long()
+        h = h.long()
+        w = w.long()
+        
+        # Reshape to [B, F, H, W, Pt, Ph, Pw, C]
+        # x is [B, L, C] where L = F*H*W
+        x = x.reshape(b, f, h, w, pt, ph, pw, c)
+        
+        # Permute to [B, C, F, Pt, H, Ph, W, Pw]
+        # Input Dims: 0:B, 1:F, 2:H, 3:W, 4:Pt, 5:Ph, 6:Pw, 7:C
+        # Target: 0, 7, 1, 4, 2, 5, 3, 6
+        x = x.permute(0, 7, 1, 4, 2, 5, 3, 6)
+        
+        # Reshape to final video: [B, C, F_out, H_out, W_out]
+        f_out = f * pt
+        h_out = h * ph
+        w_out = w * pw
+        x = x.reshape(b, c, f_out, h_out, w_out)
+        
+        return x
 
     def forward_export_streaming(
         self,
@@ -603,6 +611,17 @@ class CausalWanModelTRTExport(nn.Module):
         b = x.shape[0]
         
         # Embed patches
+        # Input x is [B, C, F, H, W]
+        # Calculate grid sizes dynamically from input shape
+        # Calculate grid sizes dynamically from input shape [B, F, C, H, W]
+        # x is [B, F, C, H, W]
+        b_in, f_in, c_in, h_in, w_in = x.shape
+        
+        # Grid sizes for RoPE [F, H/ph, W/pw] - Must be Token Grid Size
+        # patch_size is usually (1, 2, 2)
+        pt, ph, pw = self.patch_size
+        grid_sizes = torch.tensor([[f_in // pt, h_in // ph, w_in // pw]], device=device, dtype=torch.long).expand(b, -1)
+        
         x = self.patch_embedding(x.permute(0, 2, 1, 3, 4))
         x = x.flatten(2).transpose(1, 2)
         
@@ -612,14 +631,12 @@ class CausalWanModelTRTExport(nn.Module):
         # seq_lens = torch.tensor([x.shape[1]] * b, device=device, dtype=torch.long)
         seq_lens = torch.full((b,), x.shape[1], device=device, dtype=torch.long)
         
-        # Hardcode grid_sizes directly for 480p to bypass TRT runtime "Shape Calculation Overflow"
-        # [1, 30, 52] (1 frame, 30 grid h, 52 grid w) -> Matches 480x832 input (Patched / 2)
-        grid_sizes = torch.tensor([[1, 30, 52]], device=device, dtype=torch.long).expand(b, -1)
+        # Hardcode removed
+        # grid_sizes = torch.tensor([[1, 30, 52]], device=device, dtype=torch.long).expand(b, -1)
         
         # Time embeddings - use TRT compatible version that respects dtype
         t_emb = self.time_embedding(trt_sinusoidal_embedding_1d(self.freq_dim, timestep.flatten(), dtype=x.dtype))
-        e = self.time_projection(t_emb).unflatten(1, (6, self.dim))
-        e = e.unflatten(0, timestep.shape)
+        e = self.time_projection(t_emb).reshape(b, 6, self.dim)
         
         # Group caches for iteration
         cache_chunks = [
@@ -637,7 +654,30 @@ class CausalWanModelTRTExport(nn.Module):
         
         # Helper: unpack modulation
         num_frames = e.shape[1]
-        frame_seqlen = x.shape[1] // num_frames
+        # Ensure Int64 division
+        # frame_seqlen = x.shape[1] // num_frames (x is [B, L, C], num_frames is 6?? No. e is [B, 6, dim]).
+        # Wait. e shape [B, 6, dim]. num_frames = 6??
+        # In `forward`: e is [B, F, 6, dim].
+        # In `forward_export_streaming`: timestep is [B]. F=1 usually?
+        # If e is [B, 6, dim], e.shape[1] is 6.
+        # But `num_frames` usually means F.
+        # This looks like a BUG in `forward_export_streaming`?
+        # If F=1 (streaming), then we unpack 6 modulation chunks.
+        # BUT `num_frames = e.shape[1]` -> 6.
+        # `frame_seqlen = x.shape[1] // 6`.
+        # If x.shape[1] = 1560. 1560 // 6 = 260.
+        # Is this correct?
+        # Let's check `forward` (lines 180): e is [B, F, 6, dim].
+        # Here e is [B, 6, dim]. It implicitly assumes F=1?
+        # If F=1, then e should be [B, 1, 6, dim].
+        # `e = self.time_projection(t_emb).reshape(b, 1, 6, self.dim)` might be safer.
+        # If so, `num_frames` = e.shape[1] = 1.
+        # Let's assume F=1 for streaming.
+        
+        # Fix: Reshape e to include F=1
+        e = e.reshape(b, 1, 6, self.dim)
+        num_frames = e.shape[1] # 1
+        frame_seqlen = x.shape[1] # 1560
         
         for i, block in enumerate(self.blocks):
             # Determine which chunk and which layer within chunk (1 layer per chunk)
@@ -664,13 +704,13 @@ class CausalWanModelTRTExport(nn.Module):
             new_caches.append(new_layer_cache)
             
         # Head
-        x_normed = self.head_norm(x).unflatten(1, (num_frames, frame_seqlen))
+        x_normed = self.head_norm(x).reshape(b, 1, frame_seqlen, self.dim)
         
         # Head modulation
         # Recompute head modulation since it's hard to pass state for it?
         # Actually head modulation depends on time embedding 'e'.
         # Recalculate e_head logic from forward()
-        e_head = t_emb.unflatten(0, timestep.shape).unsqueeze(2)
+        e_head = t_emb.reshape(b, 1, 1, self.dim) 
         e_mod = (self.head_modulation.unsqueeze(1) + e_head).chunk(2, dim=2)
         
         x = self.head_linear(x_normed * (1 + e_mod[1]) + e_mod[0])

@@ -19,7 +19,7 @@ import argparse
 import os
 import time
 import logging
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -326,19 +326,25 @@ class TRTAcceleratedInferencePipeline:
         noise: torch.Tensor,
         current_start: int,
         current_end: int,
+        logical_frame_idx: int,
         current_step: Optional[int] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, int]:
         """
         TRT-accelerated streaming inference (matches PyTorch's inference_stream).
         Processes one frame through the denoising batch using TRT engine.
+        Returns: (output_tensor, num_new_tokens_consumed)
         """
         if not self.streaming:
-            return self.pytorch_pipeline.inference_stream(
+            # Legacy PyTorch path (not used in this fix)
+            out = self.pytorch_pipeline.inference_stream(
                 noise=noise,
                 current_start=current_start,
                 current_end=current_end,
                 current_step=current_step,
             )
+            return out, 0
+            
+        # ... implementation ...
         
         # Get dependencies
         conditional_dict = self.pytorch_pipeline.conditional_dict
@@ -372,7 +378,7 @@ class TRTAcceleratedInferencePipeline:
         # Otherwise, start_frame_idx keeps growing and crashes TRT shape inference.
         kv_cache_size = self.cache_metadata['kv_cache_size']
         start_frame_idx_t = torch.tensor(
-            [(current_start % kv_cache_size) // frame_seqlen], 
+            [logical_frame_idx], 
             device=device, 
             dtype=torch.long
         )
@@ -388,25 +394,17 @@ class TRTAcceleratedInferencePipeline:
                 prompt_slice = prompt_embeds[b_idx:b_idx+1]
                 
                 # Check eviction
-                current_end_for_batch = current_start + num_new_tokens
-                local_end = self.cache_metadata['local_end_index'][b_idx].item()
-                global_end = self.cache_metadata['global_end_index'][b_idx].item()
-                kv_cache_size = self.cache_metadata['kv_cache_size']
-                
-                if (current_end_for_batch > global_end) and \
-                   (num_new_tokens + local_end > kv_cache_size):
-                    logger.info(f"[Eviction] Batch {b_idx}: Cache full ({local_end + num_new_tokens}/{kv_cache_size}), triggering eviction")
-                    new_local_end = self._evict_kv_cache(b_idx, num_new_tokens, frame_seqlen)
-                    local_end = new_local_end
+                # In Ring Buffer mode (Streaming), simply overwrite based on current_start.
+                # current_start is already wrapped modulo max_seq_len by the caller.
                 
                 cache_chunks = self.trt_kv_cache[b_idx]
                  
-                # Physical Start for Cache Write
-                current_start_physical_t = torch.tensor([local_end], device=device, dtype=torch.long)
+                # Physical Start for Cache Write = current_start (Ring Buffer Index)
+                current_start_physical_t = torch.tensor([current_start], device=device, dtype=torch.long)
                  
                 # Call TRT engine
                 flow_out, _ = self.dit_engine(
-                    img_slice, 
+                    noisy_image, 
                     torch.full((1, F), current_step if current_step is not None else 0, device=device, dtype=torch.long),
                     prompt_slice,
                     cache_chunks,
@@ -415,11 +413,8 @@ class TRTAcceleratedInferencePipeline:
                 )
                 flow_preds.append(flow_out)
                 
-                # Update metadata
-                if current_end_for_batch > global_end:
-                    new_local = min(local_end + num_new_tokens, kv_cache_size)
-                    self.cache_metadata['global_end_index'][b_idx] = current_end_for_batch
-                    self.cache_metadata['local_end_index'][b_idx] = new_local
+                # Update metadata for consistency (though main loop drives index)
+                self.cache_metadata['local_end_index'][b_idx] = (current_start + num_new_tokens) % kv_cache_size
             
             output = torch.cat(flow_preds, dim=0)
         else:
@@ -427,23 +422,12 @@ class TRTAcceleratedInferencePipeline:
             b_idx = 0
             
             # Check eviction
-            current_end_for_batch = current_start + num_new_tokens
-            local_end = self.cache_metadata['local_end_index'][b_idx].item()
-            global_end = self.cache_metadata['global_end_index'][b_idx].item()
-            kv_cache_size = self.cache_metadata['kv_cache_size']
+            # In Ring Buffer mode, we trust current_start is the correct physical slot.
             
-            if (current_end_for_batch > global_end) and \
-               (num_new_tokens + local_end > kv_cache_size):
-                logger.info(f"[Eviction] Batch {b_idx}: Cache full ({local_end + num_new_tokens}/{kv_cache_size}), triggering eviction")
-                new_local_end = self._evict_kv_cache(b_idx, num_new_tokens, frame_seqlen)
-                local_end = new_local_end
+            cache_chunks = self.trt_kv_cache[b_idx]
             
-            # Call TRT engine
-            cache_chunks = self.trt_kv_cache[0]
-            
-            # Physical Start for Cache Write based on local_end
-            # Physical Start for Cache Write based on local_end
-            current_start_physical_t = torch.tensor([local_end], device=device, dtype=torch.long)
+            # Physical Start for Cache Write based on current_start
+            current_start_physical_t = torch.tensor([current_start], device=device, dtype=torch.long)
             
             timestep = torch.full((B, F), current_step if current_step is not None else 0, device=device, dtype=torch.long)
             
@@ -453,14 +437,12 @@ class TRTAcceleratedInferencePipeline:
             logger.info(f"  context: {prompt_embeds.shape} mean={prompt_embeds.float().mean().item():.4f} std={prompt_embeds.float().std().item():.4f}")
             logger.info(f"  current_start (phys): {current_start_physical_t.shape} item={current_start_physical_t.item()}")
             logger.info(f"  start_frame (logic): {start_frame_idx_t.shape} item={start_frame_idx_t.item()}")
-            logger.info(f"  local_end: {local_end}")
-            logger.info(f"  local_end: {local_end}")
             logger.info(f"  num_new_tokens: {num_new_tokens}")
             
             # SANITY CHECK: Verify 6D Shapes and Dtypes
             logger.info("[TRT SANITY] Checking Inputs before DiT Engine Call:")
-            for i, c in enumerate(cache_chunks):
-                logger.info(f"  KV {i}: shape={c.shape} dtype={c.dtype} stride={c.stride()}")
+            # for i, c in enumerate(cache_chunks):
+            #     logger.info(f"  KV {i}: shape={c.shape} dtype={c.dtype} stride={c.stride()}")
             logger.info(f"  current_start_physical_t: {current_start_physical_t.item()} dtype={current_start_physical_t.dtype} shape={current_start_physical_t.shape}")
             logger.info(f"  start_frame_idx_t: {start_frame_idx_t.item()} dtype={start_frame_idx_t.dtype} shape={start_frame_idx_t.shape}")
 
@@ -475,16 +457,14 @@ class TRTAcceleratedInferencePipeline:
             logger.info(f"  [TRT DEBUG] TRT Output: shape={output.shape} mean={output.float().mean().item():.4f} std={output.float().std().item():.4f}")
             
             # Update metadata
-            if current_end_for_batch > global_end:
-                new_local = min(local_end + num_new_tokens, kv_cache_size)
-                self.cache_metadata['global_end_index'][b_idx] = current_end_for_batch
-                self.cache_metadata['local_end_index'][b_idx] = new_local
+            self.cache_metadata['local_end_index'][b_idx] = (current_start + num_new_tokens) % kv_cache_size
         
         # Return output (no scheduler step, PyTorch's inference_stream returns prediction directly)
         # TRT output is [B, C, T, H, W], but pipeline expects [B, T, C, H, W]
         if len(output.shape) == 5:
              output = output.permute(0, 2, 1, 3, 4)
-        return output.to(torch.bfloat16)
+             
+        return output.to(torch.bfloat16), num_new_tokens
     
     def _sync_pytorch_kv_to_trt(self):
         """
@@ -594,10 +574,15 @@ class TRTAcceleratedInferencePipeline:
         dit_fps_list = []
         
         start_idx = 0
-        end_idx = 17 # Increase to 17 (1 header + 16 body) to ensure robust VAE initialization
+        # Keep chunk contract aligned with PyTorch baseline inference:
+        # warmup uses 5 frames, then every loop consumes `chunk_size` (default=4).
+        end_idx = 5
         current_start = 0
         # Initialize current_end for prepare. This limits how much PyTorch caches.
         current_end = self.pytorch_pipeline.frame_seq_length * 2
+        
+        # Track logical frame count for RoPE (unwrapped)
+        total_logical_frames = 0
         
         torch.cuda.synchronize()
         start_time = time.time()
@@ -646,6 +631,7 @@ class TRTAcceleratedInferencePipeline:
              # Starting at 3120 with empty cache causes Shape Overflow in attention plugin.
              current_end = 0
              end_idx = 0
+             total_logical_frames = 0
              
              # Reset Metadata to 0
              for b_idx in range(len(self.trt_kv_cache)):
@@ -673,7 +659,7 @@ class TRTAcceleratedInferencePipeline:
         while self.processed < num_chunks + num_steps - 1:
             start_idx = end_idx
             end_idx = end_idx + chunk_size
-            current_start = current_end
+            # current_start = current_end # REMOVED: In Ring Buffer mode, current_start persists and wraps naturally.
             # FIX: With chunk_size=1, (1//4) was 0, so current_end never updated!
             # The '4' likely came from legacy code assuming 4 frames per block.
             # We should just multiply by chunk_size since frame_seq_length is usually per-frame (1560).
@@ -681,12 +667,7 @@ class TRTAcceleratedInferencePipeline:
             # Verified: frame_seq_length in WanPipeline is (H//16)*(W//16).
             # So increment should be chunk_size * frame_seq_len.
             
-            # Logic Update: current_end is managed inside the latent loop now.
-            # We must NOT increment it here again based on chunk_size if we do it inside.
-            # But wait, start_idx/end_idx still proceed by chunk_size.
-            # current_start for the NEXT chunk should be the current_end AFTER the loop.
-            # So we don't need to increment it here.
-            pass
+            # `current_end` is advanced inside the per-latent loop.
             
             # Check for cache overflow
             
@@ -696,7 +677,6 @@ class TRTAcceleratedInferencePipeline:
             # Eviction logic inside inference_stream_trt handles the physical limit.
             # if current_end >= self.max_seq_len:
             #     logger.warning(f"Logical Index {current_end} > Max {self.max_seq_len}. Relying on Ring Buffer.")
-            pass
             
             if input_video is not None and end_idx <= input_video.shape[2]:
                 inp = input_video[:, :, start_idx:end_idx]
@@ -739,47 +719,34 @@ class TRTAcceleratedInferencePipeline:
                     # DiT inference (TRT integration point)
                     # sub_noisy shape: [B, 1, C, H, W] -> e.g. [1, 1, 16, 60, 104]
                     
-                    sub_pred = self.inference_stream_trt(
+                    # Increment for next latent
+                    frame_seq = self.pytorch_pipeline.frame_seq_length
+                    
+                    sub_pred, num_tokens_added = self.inference_stream_trt(
                         noise=sub_noisy,
                         current_start=current_start,
                         current_end=current_end,
+                        logical_frame_idx=total_logical_frames,
                         current_step=current_step,
                     )
                     
                     denoised_latents_list.append(sub_pred)
                     
-                    # Increment for next latent
-                    frame_seq = self.pytorch_pipeline.frame_seq_length
+                    # Advance Ring Buffer Pointers
+                    # Update physical pointer by exact number of tokens used
+                    current_start = (current_start + num_tokens_added) % self.max_seq_len
                     
                     # Advance logical time for next iteration
-                    current_start = current_end
-                    current_end = current_end + frame_seq
-                    
-                    # Wrap logical timeline only (not physical cache)
-                    if current_start >= self.max_seq_len:
-                        current_start = current_start % self.max_seq_len
-                    if current_end >= self.max_seq_len:
-                        current_end = current_end % self.max_seq_len
-                    # Update current_start if needed? No, Ring Buffer handles cache indices via modulo.
-                    # But for correct KV referencing? 
-                    # If T=1, next T=1 depends on this one.
-                    # `current_start` argument in `inference_stream_trt` is usually `start_turn_index` (cache sink check).
-                    # Actually `inference_stream_trt` uses `current_start` mainly to check if we are full?
-                    # Let's trust `current_end` increment is enough.
+                    total_logical_frames += 1
                     
                     if self.processed > 3:
                         torch.cuda.synchronize()
-                        # FPS based on 1 latent (~4 frames)
-                        # chunk_size is total frames.
-                        # Per latent time.
-                        # Total FPS will be calc'd at end of block.
-                        pass
                 
-                denoised_pred = torch.cat(denoised_latents_list, dim=2)
+                # Concatenate over temporal axis [B, T, C, H, W]
+                denoised_pred = torch.cat(denoised_latents_list, dim=1)
             else:
                  # Padding case (unused in V2V usually)
-                 pass
-                 denoised_pred = torch.zeros(1, 5, 16, 60, 104, device=self.device, dtype=torch.bfloat16)
+                 denoised_pred = torch.zeros(1, 1, 16, 60, 104, device=self.device, dtype=torch.bfloat16)
 
             
             if self.processed > 3:
@@ -817,7 +784,6 @@ class TRTAcceleratedInferencePipeline:
         video = np.concatenate(video_list, axis=0)
         fps_avg = np.mean(np.array(fps_list)) if fps_list else 0
         
-        logger.info(f"DiT Average FPS: {np.mean(np.array(dit_fps_list)) if dit_fps_list else 0:.4f}")
         logger.info(f"Video shape: {video.shape}, Average FPS: {fps_avg:.4f}")
         
         output_path = os.path.join(output_folder, "output_trt.mp4")
@@ -840,6 +806,7 @@ def main():
     parser.add_argument("--step", type=int, default=2)
     parser.add_argument("--num_frames", type=int, default=81)
     parser.add_argument("--model_type", type=str, default="T2V-1.3B", help="Model type")
+    parser.add_argument("--chunk_size", type=int, default=8, help="Streaming chunk size (8 is safe for VAE, <24k tokens).")
     
     # New args
     parser.add_argument("--guidance_scale", type=float, default=5.0, help="CFG scale. Set to 1.0 to save memory.")
@@ -896,7 +863,7 @@ def main():
     prompts = [dataset[0]]
     
     # Run inference
-    chunk_size = 17
+    chunk_size = args.chunk_size
     num_chunks = (t - 1) // chunk_size
     num_steps = len(config.denoising_step_list)
     

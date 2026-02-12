@@ -90,7 +90,13 @@ def parse_args():
         "--fp16",
         action="store_true",
         default=True,
-        help="Use FP16 precision",
+        help="Use FP16 precision (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-fp16",
+        action="store_false",
+        dest="fp16",
+        help="Disable FP16 and build FP32 engines",
     )
     parser.add_argument(
         "--force_rebuild",
@@ -100,14 +106,14 @@ def parse_args():
     parser.add_argument(
         "--build_dit",
         action="store_true",
-        default=True,
-        help="Build DiT engine",
+        default=False,
+        help="Build DiT engine (legacy compatibility flag)",
     )
     parser.add_argument(
         "--build_vae",
         action="store_true",
-        default=True,
-        help="Build VAE engines",
+        default=False,
+        help="Build VAE engines (legacy compatibility flag)",
     )
     parser.add_argument(
         "--skip_vae",
@@ -118,8 +124,8 @@ def parse_args():
     parser.add_argument(
         "--build_t5",
         action="store_true",
-        default=True,
-        help="Build T5 encoder engine",
+        default=False,
+        help="Build T5 encoder engine (legacy compatibility flag)",
     )
     parser.add_argument(
         "--skip_t5",
@@ -160,7 +166,13 @@ def parse_args():
         "--streaming",
         action="store_true",
         default=True,
-        help="Build streaming-optimized DiT engine with KV cache",
+        help="Build streaming-optimized DiT engine with KV cache (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-streaming",
+        action="store_false",
+        dest="streaming",
+        help="Build non-streaming DiT engine",
     )
     parser.add_argument(
         "--max_seq_len",

@@ -364,6 +364,7 @@ class EngineBuilder:
             "kv_cache_28": {2: "batch", 3: "seq_len"},
             "kv_cache_29": {2: "batch", 3: "seq_len"},
             "current_start": {0: "batch"},
+            "start_frame_idx": {0: "batch"},
             "output": {0: "batch", 2: "frames", 3: "height", 4: "width"},
             "new_kv_cache_0": {2: "batch", 3: "seq_len"},
             "new_kv_cache_1": {2: "batch", 3: "seq_len"},
