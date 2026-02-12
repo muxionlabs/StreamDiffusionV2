@@ -215,7 +215,7 @@ def export_to_onnx(
             output_names=output_names,
             dynamic_axes=dynamic_axes,
             opset_version=opset_version,
-            do_constant_folding=True,
+            do_constant_folding=False,  # MUST be False to preserve PyTorch param names
             verbose=False,
         )
     
@@ -249,15 +249,22 @@ def export_to_onnx(
         onnx_dtype = onnx.TensorProto.FLOAT
         np_dtype = np.float32
     
+    # Count name types for debugging
+    onnx_auto = [i.name for i in onnx_model.graph.initializer if i.name.startswith('onnx::')]
+    pt_named = [i.name for i in onnx_model.graph.initializer if not i.name.startswith('onnx::')]
+    logger.info(f"  Initializers: {len(onnx_model.graph.initializer)} total, "
+                f"{len(pt_named)} PyTorch-named, {len(onnx_auto)} onnx::-auto-named")
+    
     injected = 0
     skipped = 0
+    skipped_names = []
+    
     for initializer in onnx_model.graph.initializer:
         name = initializer.name
         tensor = pt_state.get(name)
         if tensor is None:
             skipped += 1
-            if skipped <= 5:
-                logger.warning(f"  No PyTorch weight found for ONNX initializer: {name}")
+            skipped_names.append(name)
             continue
         
         # Convert to numpy (handle bfloat16 which numpy doesn't support)
@@ -271,6 +278,14 @@ def export_to_onnx(
         initializer.raw_data = tensor_np.tobytes()
         initializer.data_type = onnx_dtype
         injected += 1
+    
+    if skipped_names:
+        logger.warning(f"  {skipped} initializers not matched. First 10:")
+        for n in skipped_names[:10]:
+            # Find shape
+            init = next(i for i in onnx_model.graph.initializer if i.name == n)
+            logger.warning(f"    {n}: shape={list(init.dims)}")
+    
     
     logger.info(f"  Injected {injected} weights, skipped {skipped}")
     
