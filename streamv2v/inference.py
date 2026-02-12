@@ -125,9 +125,21 @@ class SingleGPUInferencePipeline:
             handler.setFormatter(formatter)
             self.logger.addHandler(handler)
         
-        # Initialize pipeline
-        self.pipeline = CausalStreamInferencePipeline(config, device=str(device))
-        self.pipeline.to(device=str(device), dtype=torch.bfloat16)
+        # Initialize pipeline (PyTorch or TRT)
+        engine_type = getattr(config, 'engine', 'pytorch')
+        engine_path = getattr(config, 'engine_path', None)
+        
+        if engine_type == 'trt' and engine_path:
+            from causvid.acceleration.tensorrt.trt_stream_inference import (
+                TRTCausalStreamInferencePipeline
+            )
+            self.logger.info(f"Using TRT engine: {engine_path}")
+            self.pipeline = TRTCausalStreamInferencePipeline(
+                config, device=str(device), engine_path=engine_path)
+            self.pipeline.to(device=str(device), dtype=torch.bfloat16)
+        else:
+            self.pipeline = CausalStreamInferencePipeline(config, device=str(device))
+            self.pipeline.to(device=str(device), dtype=torch.bfloat16)
         
         # Performance tracking
         self.t_dit = 100.0
@@ -333,6 +345,10 @@ def main():
     parser.add_argument("--num_frames", type=int, default=81, help="Video length (number of frames)")
     parser.add_argument("--fixed_noise_scale", action="store_true", default=False)
     parser.add_argument("--img2img", action="store_true", default=False, help="Enable img2img mode: extract a single frame from img2vid output.")
+    parser.add_argument("--engine", type=str, default="pytorch", choices=["pytorch", "trt"],
+                       help="Inference engine: 'pytorch' (default) or 'trt' (TensorRT)")
+    parser.add_argument("--engine_path", type=str, default=None,
+                       help="Path to TRT engine file (required when --engine trt)")
     args = parser.parse_args()
     
     torch.set_grad_enabled(False)

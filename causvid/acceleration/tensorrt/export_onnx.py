@@ -1,0 +1,279 @@
+"""
+ONNX export for TRTCausalWanModel.
+
+Exports the TRT-safe model to ONNX format with dynamic axes for:
+- batch_size (dim 0)
+- seq_len (dim 1 of hidden states)  
+- kv_cache_len (dim 2 of KV cache)
+
+Usage:
+    python -m causvid.acceleration.tensorrt.export_onnx \
+        --config_path configs/wan_causal_dmd_v2v.yaml \
+        --checkpoint_folder ckpts/wan_causal_dmd_v2v \
+        --output_path engines/wan_causal_dit.onnx
+"""
+
+import argparse
+import os
+import json
+import logging
+import torch
+from omegaconf import OmegaConf
+
+from causvid.acceleration.tensorrt.trt_model import TRTCausalWanModel
+from causvid.acceleration.tensorrt.weight_converter import load_checkpoint_for_trt
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+# Default model config for T2V-1.3B
+T2V_1_3B_CONFIG = dict(
+    model_type='t2v',
+    patch_size=(1, 2, 2),
+    text_len=512,
+    in_dim=16,
+    dim=1536,
+    ffn_dim=3840,
+    freq_dim=256,
+    text_dim=4096,
+    out_dim=16,
+    num_heads=12,
+    num_layers=30,
+    qk_norm=True,
+    cross_attn_norm=True,
+    eps=1e-6,
+)
+
+
+def create_dummy_inputs(
+    batch_size: int = 1,
+    num_frames: int = 1,
+    height: int = 480,
+    width: int = 832,
+    num_layers: int = 30,
+    max_cache_len: int = 15600,
+    text_len: int = 512,
+    num_heads: int = 12,
+    head_dim: int = 128,
+    text_dim: int = 4096,
+    device: str = "cpu",
+    dtype: torch.dtype = torch.float32,
+):
+    """Create dummy inputs matching the TRTCausalWanModel.forward() signature."""
+    
+    # Patch grid dimensions
+    H_p = height // 2   # patch_size[1] = 2
+    W_p = width // 2    # patch_size[2] = 2
+    frame_seq_len = H_p * W_p  # 240 * 416 / 4 = 24960? No, H/2 * W/2
+    # Wait: height=480, patch_size_h=2, so H_p = 480/2 = 240. But that's spatial.
+    # Actually the latent is H/8, W/8 from VAE, then patch /2 each.
+    # So H_latent = 480/8 = 60, W_latent = 832/8 = 104
+    # After patch embedding (stride 2 in H,W): H_p = 60/2 = 30, W_p = 104/2 = 52
+    H_latent = height // 8
+    W_latent = width // 8
+    H_p = H_latent // 2  # 30
+    W_p = W_latent // 2  # 52
+    frame_seq_len = H_p * W_p  # 1560
+    
+    inputs = {
+        'x': torch.randn(batch_size, 16, num_frames, H_latent, W_latent,
+                         device=device, dtype=dtype),
+        'timestep': torch.tensor([[500] * num_frames], device=device, dtype=torch.long)
+                    .expand(batch_size, -1),
+        'context': torch.randn(batch_size, text_len, text_dim,
+                               device=device, dtype=dtype),
+        'current_start': torch.tensor([0], device=device, dtype=torch.long)
+                        .expand(batch_size),
+        'current_end': torch.tensor([frame_seq_len * num_frames], device=device,
+                                    dtype=torch.long).expand(batch_size),
+        'all_kv_k': torch.zeros(batch_size, num_layers, max_cache_len,
+                                num_heads, head_dim, device=device, dtype=dtype),
+        'all_kv_v': torch.zeros(batch_size, num_layers, max_cache_len,
+                                num_heads, head_dim, device=device, dtype=dtype),
+        'all_kv_seq_lens': torch.zeros(batch_size, num_layers, device=device,
+                                       dtype=torch.long),
+        'all_local_start_indices': torch.zeros(batch_size, num_layers,
+                                               device=device, dtype=torch.long),
+        'all_crossattn_k': torch.randn(batch_size, num_layers, text_len,
+                                       num_heads, head_dim, device=device, dtype=dtype),
+        'all_crossattn_v': torch.randn(batch_size, num_layers, text_len,
+                                       num_heads, head_dim, device=device, dtype=dtype),
+    }
+    
+    return inputs
+
+
+def export_to_onnx(
+    model: TRTCausalWanModel,
+    output_path: str,
+    batch_size: int = 1,
+    num_frames: int = 1,
+    height: int = 480,
+    width: int = 832,
+    max_cache_len: int = 15600,
+    opset_version: int = 17,
+):
+    """
+    Export the TRT-safe model to ONNX.
+    
+    Args:
+        model: TRTCausalWanModel with loaded weights
+        output_path: Path to save .onnx file
+        batch_size: Batch size for dummy inputs
+        num_frames: Number of frames per chunk
+        height: Video height (before VAE)
+        width: Video width (before VAE)
+        max_cache_len: Maximum KV cache length
+        opset_version: ONNX opset version
+    """
+    model.eval()
+    device = next(model.parameters()).device
+    dtype = next(model.parameters()).dtype
+    
+    # Create dummy inputs
+    inputs = create_dummy_inputs(
+        batch_size=batch_size,
+        num_frames=num_frames,
+        height=height,
+        width=width,
+        num_layers=model.num_layers,
+        max_cache_len=max_cache_len,
+        text_len=model.text_len,
+        num_heads=model.num_heads,
+        head_dim=model.head_dim,
+        text_dim=model.text_dim,
+        device=str(device),
+        dtype=dtype,
+    )
+    
+    # Input/output names for ONNX
+    input_names = list(inputs.keys())
+    output_names = [
+        'output',
+        'out_kv_k',
+        'out_kv_v', 
+        'out_kv_seq_lens',
+    ]
+    
+    # Dynamic axes
+    H_latent = height // 8
+    W_latent = width // 8
+    H_p = H_latent // 2
+    W_p = W_latent // 2
+    frame_seq_len = H_p * W_p
+    
+    dynamic_axes = {
+        # Input latent: batch and frames are dynamic
+        'x': {0: 'batch', 2: 'num_frames'},
+        'timestep': {0: 'batch', 1: 'num_frames'},
+        'context': {0: 'batch'},
+        'current_start': {0: 'batch'},
+        'current_end': {0: 'batch'},
+        # KV cache: batch and cache_len are dynamic
+        'all_kv_k': {0: 'batch', 2: 'cache_len'},
+        'all_kv_v': {0: 'batch', 2: 'cache_len'},
+        'all_kv_seq_lens': {0: 'batch'},
+        'all_local_start_indices': {0: 'batch'},
+        'all_crossattn_k': {0: 'batch'},
+        'all_crossattn_v': {0: 'batch'},
+        # Outputs
+        'output': {0: 'batch', 2: 'out_frames'},
+        'out_kv_k': {0: 'batch', 2: 'cache_len'},
+        'out_kv_v': {0: 'batch', 2: 'cache_len'},
+        'out_kv_seq_lens': {0: 'batch'},
+    }
+    
+    logger.info(f"Exporting ONNX to {output_path}")
+    logger.info(f"  Input shapes: {', '.join(f'{k}={v.shape}' for k,v in inputs.items())}")
+    
+    os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+    
+    # Use tuple of values in the order defined by input_names
+    input_tuple = tuple(inputs[name] for name in input_names)
+    
+    with torch.no_grad():
+        torch.onnx.export(
+            model,
+            input_tuple,
+            output_path,
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
+            opset_version=opset_version,
+            do_constant_folding=True,
+            verbose=False,
+        )
+    
+    logger.info(f"ONNX export complete: {output_path}")
+    
+    # Save metadata alongside
+    metadata = {
+        'model_type': 'T2V-1.3B',
+        'height': height,
+        'width': width,
+        'H_p': H_p,
+        'W_p': W_p,
+        'frame_seq_len': frame_seq_len,
+        'max_cache_len': max_cache_len,
+        'num_layers': model.num_layers,
+        'num_heads': model.num_heads,
+        'head_dim': model.head_dim,
+        'dim': model.dim,
+        'text_len': model.text_len,
+        'patch_size': list(model.patch_size),
+        'opset_version': opset_version,
+        'input_names': input_names,
+        'output_names': output_names,
+    }
+    meta_path = output_path.replace('.onnx', '_metadata.json')
+    with open(meta_path, 'w') as f:
+        json.dump(metadata, f, indent=2)
+    logger.info(f"Metadata saved: {meta_path}")
+    
+    return output_path
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Export TRT-safe model to ONNX")
+    parser.add_argument("--config_path", type=str, required=True,
+                       help="Path to YAML config (e.g. configs/wan_causal_dmd_v2v.yaml)")
+    parser.add_argument("--checkpoint_folder", type=str, required=True,
+                       help="Path to checkpoint folder")
+    parser.add_argument("--output_path", type=str, default="engines/wan_causal_dit.onnx",
+                       help="Output ONNX file path")
+    parser.add_argument("--height", type=int, default=480)
+    parser.add_argument("--width", type=int, default=832)
+    parser.add_argument("--max_cache_len", type=int, default=15600,
+                       help="Max KV cache length (default: 10 frames * 1560 tokens/frame)")
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--fp16", action="store_true", default=False,
+                       help="Export in FP16 precision")
+    args = parser.parse_args()
+    
+    # Load config
+    config = OmegaConf.load(args.config_path)
+    
+    # Create TRT model
+    model_config = T2V_1_3B_CONFIG.copy()
+    model = TRTCausalWanModel(**model_config)
+    
+    dtype = torch.float16 if args.fp16 else torch.float32
+    model = model.to(device=args.device, dtype=dtype)
+    
+    # Load weights
+    ckpt_path = os.path.join(args.checkpoint_folder, "model.pt")
+    load_checkpoint_for_trt(ckpt_path, model, strict=False)
+    
+    # Export
+    export_to_onnx(
+        model=model,
+        output_path=args.output_path,
+        height=args.height,
+        width=args.width,
+        max_cache_len=args.max_cache_len,
+    )
+
+
+if __name__ == "__main__":
+    main()
