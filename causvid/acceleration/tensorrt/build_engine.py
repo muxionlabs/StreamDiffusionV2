@@ -78,13 +78,14 @@ def build_engine(
         else:
             logger.warning("FP16 not supported on this platform, using FP32")
     
-    # Parse ONNX
+    # Parse ONNX — use parse_from_file so TRT can locate external weight files
     logger.info(f"Parsing ONNX: {onnx_path}")
-    with open(onnx_path, 'rb') as f:
-        if not parser.parse(f.read()):
-            for i in range(parser.num_errors):
-                logger.error(f"ONNX parse error: {parser.get_error(i)}")
-            raise RuntimeError("Failed to parse ONNX model")
+    onnx_path_abs = os.path.abspath(onnx_path)
+    success = parser.parse_from_file(onnx_path_abs)
+    if not success:
+        for i in range(parser.num_errors):
+            logger.error(f"ONNX parse error: {parser.get_error(i)}")
+        raise RuntimeError("Failed to parse ONNX model")
     logger.info(f"ONNX parsed: {network.num_inputs} inputs, {network.num_outputs} outputs")
     
     # Create optimization profile

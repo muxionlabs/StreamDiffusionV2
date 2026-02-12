@@ -115,7 +115,11 @@ def export_to_onnx(
     opset_version: int = 17,
 ):
     """
-    Export the TRT-safe model to ONNX.
+    Export the TRT-safe model to ONNX with external data format.
+    
+    For models > 2GB (like T2V-1.3B at ~2.6GB in FP16), weights are stored
+    in a separate .bin file alongside the .onnx file to avoid protobuf's
+    2GB message size limit.
     
     Args:
         model: TRTCausalWanModel with loaded weights
@@ -127,9 +131,17 @@ def export_to_onnx(
         max_cache_len: Maximum KV cache length
         opset_version: ONNX opset version
     """
+    import onnx
+    from onnx.external_data_helper import convert_model_to_external_data
+    
     model.eval()
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
+    
+    # Log model size
+    param_count = sum(p.numel() for p in model.parameters())
+    param_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+    logger.info(f"Model: {param_count/1e6:.1f}M params, {param_bytes/1e9:.2f} GB")
     
     # Create dummy inputs
     inputs = create_dummy_inputs(
@@ -192,6 +204,8 @@ def export_to_onnx(
     # Use tuple of values in the order defined by input_names
     input_tuple = tuple(inputs[name] for name in input_names)
     
+    # Step 1: Export to ONNX (initial export — may be incomplete for large models)
+    logger.info("Step 1/3: Running torch.onnx.export...")
     with torch.no_grad():
         torch.onnx.export(
             model,
@@ -205,9 +219,57 @@ def export_to_onnx(
             verbose=False,
         )
     
-    logger.info(f"ONNX export complete: {output_path}")
+    initial_size = os.path.getsize(output_path)
+    logger.info(f"  Initial ONNX file: {initial_size / 1e6:.1f} MB")
     
-    # Save metadata alongside
+    # Step 2: Convert to external data format for large models
+    # Protobuf has a ~2GB limit; models >2GB need external weight storage
+    logger.info("Step 2/3: Converting to external data format...")
+    
+    onnx_model = onnx.load(output_path, load_external_data=False)
+    
+    # Store all tensors > 1KB in external file
+    weight_file = os.path.basename(output_path).replace('.onnx', '_weights.bin')
+    convert_model_to_external_data(
+        onnx_model,
+        all_tensors_to_one_file=True,
+        location=weight_file,
+        size_threshold=1024,  # tensors > 1KB go to external file
+        convert_attribute=True,
+    )
+    
+    # Re-save with external data references
+    onnx.save_model(
+        onnx_model,
+        output_path,
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location=weight_file,
+        size_threshold=1024,
+    )
+    
+    final_onnx_size = os.path.getsize(output_path)
+    weight_path = os.path.join(os.path.dirname(output_path) or '.', weight_file)
+    if os.path.exists(weight_path):
+        weight_size = os.path.getsize(weight_path)
+        logger.info(f"  ONNX graph: {final_onnx_size / 1e6:.1f} MB")
+        logger.info(f"  External weights: {weight_size / 1e9:.2f} GB")
+        total_size = final_onnx_size + weight_size
+    else:
+        total_size = final_onnx_size
+        logger.warning(f"  External weight file not found at {weight_path}")
+    
+    # Validate: total size should be close to model parameter size
+    if total_size < param_bytes * 0.5:
+        logger.error(
+            f"  EXPORT LIKELY FAILED: total file size ({total_size/1e9:.2f} GB) "
+            f"is much smaller than model params ({param_bytes/1e9:.2f} GB)"
+        )
+    else:
+        logger.info(f"  Total ONNX size: {total_size / 1e9:.2f} GB ✓")
+    
+    # Step 3: Save metadata alongside
+    logger.info("Step 3/3: Saving metadata...")
     metadata = {
         'model_type': 'T2V-1.3B',
         'height': height,
@@ -225,11 +287,15 @@ def export_to_onnx(
         'opset_version': opset_version,
         'input_names': input_names,
         'output_names': output_names,
+        'weight_file': weight_file,
+        'dtype': str(dtype),
+        'param_count': param_count,
     }
     meta_path = output_path.replace('.onnx', '_metadata.json')
     with open(meta_path, 'w') as f:
         json.dump(metadata, f, indent=2)
     logger.info(f"Metadata saved: {meta_path}")
+    logger.info("ONNX export complete ✓")
     
     return output_path
 
@@ -247,8 +313,10 @@ def main():
     parser.add_argument("--max_cache_len", type=int, default=15600,
                        help="Max KV cache length (default: 10 frames * 1560 tokens/frame)")
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--fp16", action="store_true", default=False,
-                       help="Export in FP16 precision")
+    parser.add_argument("--fp16", action="store_true", default=True,
+                       help="Export in FP16 precision (default: True)")
+    parser.add_argument("--no-fp16", dest="fp16", action="store_false",
+                       help="Export in FP32 precision")
     args = parser.parse_args()
     
     # Load config
