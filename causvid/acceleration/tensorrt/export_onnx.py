@@ -132,7 +132,7 @@ def export_to_onnx(
         opset_version: ONNX opset version
     """
     import onnx
-    from onnx.external_data_helper import convert_model_to_external_data
+    import numpy as np
     
     model.eval()
     device = next(model.parameters()).device
@@ -222,34 +222,78 @@ def export_to_onnx(
     initial_size = os.path.getsize(output_path)
     logger.info(f"  Initial ONNX file: {initial_size / 1e6:.1f} MB")
     
-    # Step 2: Convert to external data format for large models
-    # Protobuf has a ~2GB limit; models >2GB need external weight storage
-    logger.info("Step 2/3: Converting to external data format...")
+    # Step 2: Inject weights from PyTorch model into ONNX graph
+    # torch.onnx.export drops weight data for models > 2GB (protobuf limit).
+    # The graph structure and initializer names are correct — we just need
+    # to fill in the actual tensor data from the PyTorch model.
+    logger.info("Step 2/3: Injecting weights into ONNX graph...")
     
     onnx_model = onnx.load(output_path, load_external_data=False)
     
-    # Store all tensors > 1KB in external file
-    weight_file = os.path.basename(output_path).replace('.onnx', '_weights.bin')
-    convert_model_to_external_data(
-        onnx_model,
-        all_tensors_to_one_file=True,
-        location=weight_file,
-        size_threshold=1024,  # tensors > 1KB go to external file
-        convert_attribute=True,
-    )
+    # Build lookup from PyTorch model (state_dict includes buffers)
+    pt_state = {}
+    for name, param in model.named_parameters():
+        pt_state[name] = param.detach().cpu()
+    for name, buf in model.named_buffers():
+        pt_state[name] = buf.detach().cpu()
     
-    # Re-save with external data references
+    # Determine ONNX data type
+    if dtype == torch.float16:
+        onnx_dtype = onnx.TensorProto.FLOAT16
+        np_dtype = np.float16
+    elif dtype == torch.bfloat16:
+        # ONNX doesn't have bfloat16 — use float16
+        onnx_dtype = onnx.TensorProto.FLOAT16
+        np_dtype = np.float16
+    else:
+        onnx_dtype = onnx.TensorProto.FLOAT
+        np_dtype = np.float32
+    
+    injected = 0
+    skipped = 0
+    for initializer in onnx_model.graph.initializer:
+        name = initializer.name
+        tensor = pt_state.get(name)
+        if tensor is None:
+            skipped += 1
+            if skipped <= 5:
+                logger.warning(f"  No PyTorch weight found for ONNX initializer: {name}")
+            continue
+        
+        # Convert to numpy (handle bfloat16 which numpy doesn't support)
+        if tensor.dtype == torch.bfloat16:
+            tensor_np = tensor.float().numpy().astype(np_dtype)
+        elif tensor.dtype == torch.float16:
+            tensor_np = tensor.numpy()
+        else:
+            tensor_np = tensor.numpy().astype(np_dtype)
+        
+        initializer.raw_data = tensor_np.tobytes()
+        initializer.data_type = onnx_dtype
+        injected += 1
+    
+    logger.info(f"  Injected {injected} weights, skipped {skipped}")
+    
+    # Now save with external data format (weights in separate .bin file)
+    weight_file = os.path.basename(output_path).replace('.onnx', '_weights.bin')
+    output_dir = os.path.dirname(output_path) or '.'
+    weight_path = os.path.join(output_dir, weight_file)
+    
+    # Remove old weight file if exists
+    if os.path.exists(weight_path):
+        os.remove(weight_path)
+    
+    logger.info(f"  Saving with external data format...")
     onnx.save_model(
         onnx_model,
         output_path,
         save_as_external_data=True,
         all_tensors_to_one_file=True,
         location=weight_file,
-        size_threshold=1024,
+        size_threshold=1024,  # tensors > 1KB go to external file
     )
     
     final_onnx_size = os.path.getsize(output_path)
-    weight_path = os.path.join(os.path.dirname(output_path) or '.', weight_file)
     if os.path.exists(weight_path):
         weight_size = os.path.getsize(weight_path)
         logger.info(f"  ONNX graph: {final_onnx_size / 1e6:.1f} MB")
