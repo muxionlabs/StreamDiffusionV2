@@ -227,8 +227,21 @@ class TRTWanDiffusionWrapper(nn.Module):
             'all_crossattn_v': all_cross_v.to(engine_dtype),
         }
         
-        # Run TRT engine
-        outputs = self.engine.infer(inputs)
+        # Run TRT engine — split batch if B > 1 (engine built with static B=1).
+        # The pipeline batches multiple denoising steps together, but the engine
+        # can only process one batch item at a time.
+        if B > 1:
+            batch_outputs = []
+            for b in range(B):
+                single_inputs = {k: v[b:b+1] for k, v in inputs.items()}
+                batch_outputs.append(self.engine.infer(single_inputs))
+            # Concatenate all outputs along batch dimension
+            outputs = {
+                key: torch.cat([bo[key] for bo in batch_outputs], dim=0)
+                for key in batch_outputs[0]
+            }
+        else:
+            outputs = self.engine.infer(inputs)
         
         # Extract flow prediction and permute back: [B, C, F, H, W] -> [B, F, C, H, W]
         flow_pred = outputs['output'].permute(0, 2, 1, 3, 4).to(
