@@ -59,21 +59,40 @@ class TRTCausalStreamInferencePipeline(CausalStreamInferencePipeline):
         
         logger.info(f"Loading TRT engine from {engine_path}")
         
-        # Replace the PyTorch generator with TRT wrapper
-        # Keep reference to original for weight extraction if needed
+        # Extract modules needed for cross-attention KV pre-computation.
+        # The TRT engine takes pre-computed cross-attn K,V as inputs — these
+        # are computed from the text prompt using text_embedding MLP +
+        # per-block cross-attn K,V projections. We extract these lightweight
+        # modules from the original PyTorch model before replacing it.
         original_generator = self.generator
+        original_model = original_generator.model
+        
+        # text_embedding: MLP converting raw text features to model dim
+        text_embedding = original_model.text_embedding
+        
+        # Per-block cross-attention K,V projection weights
+        crossattn_modules = []
+        for block in original_model.blocks:
+            crossattn_modules.append({
+                'k': block.cross_attn.k,          # nn.Linear
+                'v': block.cross_attn.v,          # nn.Linear
+                'norm_k': block.cross_attn.norm_k, # RMSNorm or Identity
+            })
         
         self.generator = TRTWanDiffusionWrapper(
             engine_path=engine_path,
             config=args,
             device=torch.device(device),
+            text_embedding=text_embedding,
+            crossattn_modules=crossattn_modules,
         )
         
         # Copy scheduler from original
         self.generator.scheduler = original_generator.scheduler
         
         # Clean up original model to free GPU memory
-        del original_generator
+        # (text_embedding + crossattn modules are still referenced by TRT wrapper)
+        del original_generator, original_model
         torch.cuda.empty_cache()
         
         logger.info("TRT pipeline initialized — generator replaced with TRT engine")
