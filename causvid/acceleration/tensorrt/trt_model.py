@@ -35,8 +35,14 @@ def precompute_rope_freqs_real(max_seq_len: int, head_dim: int, theta: float = 1
     Precompute RoPE frequencies in sin/cos real format (no complex numbers).
     Returns cos and sin tensors for temporal, height, and width axes.
     
-    Computes full-dim frequencies first, then splits — matching the original
-    PyTorch model's rope_params(max_seq_len, head_dim) + rope_apply split.
+    HYBRID approach:
+    - Temporal: uses full-dim frequencies from rope_params(max_seq_len, head_dim),
+      matching the original PyTorch model. This gives correct temporal encoding
+      for motion transfer.
+    - Spatial (H, W): uses per-axis frequencies from rope_params(max_seq_len, 2*c_h/w).
+      Full-dim spatial frequencies are ~100x weaker (the higher bands of the full
+      spectrum) and collapse to identity in FP16 TRT attention, causing green grass.
+      Per-axis spatial frequencies are stronger and proven stable in FP16.
     """
     d = head_dim
     c = d // 2  # half head dim for complex pairs
@@ -46,14 +52,15 @@ def precompute_rope_freqs_real(max_seq_len: int, head_dim: int, theta: float = 1
     c_h = c // 3             # height freq dims  (21 for head_dim=128)
     c_w = c // 3             # width freq dims   (21 for head_dim=128)
     
-    # Compute FULL frequencies matching rope_params(max_seq_len, head_dim)
-    # This gives [max_seq_len, c] complex with inv_freq[k] = 1/theta^(2k/head_dim)
+    # TEMPORAL: Full-dim (fixes motion / stuck dog)
+    # Use full head_dim scaling to match original model's temporal decay exactly
     full_freqs = rope_params(max_seq_len, head_dim)  # [max_seq_len, c] complex
+    freqs_t = full_freqs[:, :c_t]  # [max_seq_len, c_t]
     
-    # Split identically to rope_apply: [c_t, c_h, c_w]
-    freqs_t = full_freqs[:, :c_t]            # [max_seq_len, c_t]
-    freqs_h = full_freqs[:, c_t:c_t + c_h]   # [max_seq_len, c_h]
-    freqs_w = full_freqs[:, c_t + c_h:]       # [max_seq_len, c_w]
+    # SPATIAL: Per-axis (fixes green grass / FP16 stability)
+    # Use 2*c_h/w scaling to get stronger high-frequency components that survive FP16
+    freqs_h = rope_params(max_seq_len, 2 * c_h)  # [max_seq_len, c_h] complex
+    freqs_w = rope_params(max_seq_len, 2 * c_w)  # [max_seq_len, c_w] complex
     
     # Convert complex exp(i*angle) -> (cos, sin) pairs
     cos_t = freqs_t.real.float()  # [max_seq_len, c_t]

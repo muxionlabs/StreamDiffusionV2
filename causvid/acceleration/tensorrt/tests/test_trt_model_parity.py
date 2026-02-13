@@ -90,11 +90,25 @@ def test_rope_parity(device):
     x_f32 = x.float()
     grid_sizes = torch.tensor([[F, H, W]], device=device, dtype=torch.long)
     
-    # Original RoPE: rope_params(1024, head_dim) then split in rope_apply
-    # This matches the ACTUAL original model (CausalWanModel uses rope_params(1024, dim//num_heads))
-    freqs_orig = rope_params(1024, D).to(device)  # [1024, 64] complex
+    # Hybrid RoPE Reference:
+    # Temporal uses full-dim (head_dim) scaling -> matches original model motion
+    # Spatial uses per-axis (2*c_h) scaling -> stronger spatial encoding for FP16 stability
+    c = D // 2
+    c_t = c - 2 * (c // 3)
+    c_h = c // 3
+    c_w = c // 3
     
-    out_orig = rope_apply(x, grid_sizes, freqs_orig)
+    freqs_full = rope_params(1024, D)
+    freqs_small_h = rope_params(1024, 2 * c_h)
+    freqs_small_w = rope_params(1024, 2 * c_w)
+    
+    freqs_hybrid = torch.cat([
+        freqs_full[:, :c_t],        # Temporal: full-dim logic
+        freqs_small_h,              # Height: per-axis logic
+        freqs_small_w               # Width: per-axis logic
+    ], dim=1).to(device)
+    
+    out_orig = rope_apply(x, grid_sizes, freqs_hybrid)
     
     # TRT-safe RoPE (should now match since we compute full-dim then split)
     rope_freqs = precompute_rope_freqs_real(1024, D)
