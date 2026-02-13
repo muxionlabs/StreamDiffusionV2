@@ -329,9 +329,14 @@ class TRTWanDiffusionWrapper(nn.Module):
             N, D = self.num_heads, self.head_dim
             
             for i, (mods, entry) in enumerate(zip(self.crossattn_modules, crossattn_cache)):
+                # Ensure ctx matches module weight dtype (modules may not have
+                # been reached by pipeline.to(bfloat16) since they're plain dicts)
+                mod_dtype = next(mods['k'].parameters()).dtype
+                ctx_i = ctx.to(mod_dtype)
+                
                 # K projection + QK norm
-                k = mods['norm_k'](mods['k'](ctx)).view(B, -1, N, D)
-                v = mods['v'](ctx).view(B, -1, N, D)
+                k = mods['norm_k'](mods['k'](ctx_i)).view(B, -1, N, D)
+                v = mods['v'](ctx_i).view(B, -1, N, D)
                 
                 entry['k'] = k.to(torch.float16)
                 entry['v'] = v.to(torch.float16)
