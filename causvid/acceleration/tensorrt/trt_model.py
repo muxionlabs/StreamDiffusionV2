@@ -33,12 +33,15 @@ from causvid.models.wan.wan_base.modules.model import (
 def precompute_rope_freqs_real(max_seq_len: int, head_dim: int, theta: float = 10000.0):
     """
     Precompute RoPE frequencies in sin/cos real format (no complex numbers).
-    Returns cos and sin tensors of shape [max_seq_len, head_dim // 2].
     
-    We split into 3 frequency bands matching the original:
-    - temporal: head_dim - 4*(head_dim//6) dims  -> indexed by frame
-    - height:   2*(head_dim//6) dims             -> indexed by h
-    - width:    2*(head_dim//6) dims             -> indexed by w
+    CRITICAL: Must compute frequencies for the FULL head_dim first, then split
+    into temporal/height/width bands. This matches the original model which does:
+        freqs = rope_params(max_seq_len, head_dim)  # full dim
+        freqs.split([c_t, c_h, c_w], dim=1)         # then split
+    
+    Computing per-axis independently (rope_params(max_seq_len, 2*c_t)) gives
+    WRONG frequencies — different base rates and offsets that break the model's
+    spatial-temporal encoding.
     """
     d = head_dim
     c = d // 2  # half head dim for complex pairs
@@ -48,13 +51,11 @@ def precompute_rope_freqs_real(max_seq_len: int, head_dim: int, theta: float = 1
     c_h = c // 3             # height freq dims
     c_w = c // 3             # width freq dims
     
-    # Compute freqs for each axis
-    freqs_t = rope_params(max_seq_len, 2 * c_t)  # [max_seq_len, c_t] complex
-    freqs_h = rope_params(max_seq_len, 2 * c_h)  # [max_seq_len, c_h] complex
-    freqs_w = rope_params(max_seq_len, 2 * c_w)  # [max_seq_len, c_w] complex
+    # Compute freqs for FULL head_dim, then split (matching original)
+    freqs = rope_params(max_seq_len, d)  # [max_seq_len, c] complex
+    freqs_t, freqs_h, freqs_w = freqs.split([c_t, c_h, c_w], dim=1)
     
     # Convert complex to cos/sin pairs
-    # polar form: freqs = cos(theta) + i*sin(theta)
     cos_t = freqs_t.real.float()  # [max_seq_len, c_t]
     sin_t = freqs_t.imag.float()
     cos_h = freqs_h.real.float()  # [max_seq_len, c_h]
