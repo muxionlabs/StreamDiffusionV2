@@ -119,7 +119,7 @@ def test_rope_parity(device):
     out_trt = trt_rope_apply(x, grid_sizes, cos_t, sin_t, cos_h, sin_h, cos_w, sin_w)
     
     # Also test with float32 inputs for diagnosis
-    out_orig_f32 = rope_apply(x_f32, grid_sizes, freqs_orig)
+    out_orig_f32 = rope_apply(x_f32, grid_sizes, freqs_hybrid)
     out_trt_f32 = trt_rope_apply(x_f32, grid_sizes, cos_t, sin_t, cos_h, sin_h, cos_w, sin_w)
     
     # Compare bf16
