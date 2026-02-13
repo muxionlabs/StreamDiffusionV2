@@ -232,47 +232,55 @@ class TRTWanDiffusionWrapper(nn.Module):
         new_local_end = all_local_end + ce - all_global_end  # [B, L]
         correct_local_start = torch.clamp(new_local_end - frame_seq_len, min=0)
         
-        # Build engine input dict
+        # === Run engine per batch item with TRIMMED KV cache ===
+        # The original PyTorch model uses:
+        #   flash_attn_with_kvcache(q, k_cache[:, :seq_lens.max()], ...)
+        # This attends ONLY to valid cache entries. Our TRT engine's internal
+        # attention operates over the entire input cache. By trimming the
+        # cache tensor to `new_local_end` entries, we make ALL positions
+        # valid — the engine's mask becomes all-zeros, matching FlashAttention.
         engine_dtype = torch.float16
+        min_cache = self.engine.metadata.get('min_cache_len', 1560)
         
-        inputs = {
-            'x': x.to(engine_dtype),
-            'timestep': input_timestep.to(torch.int64),
-            'current_start': current_start.to(torch.int64),
-            'all_kv_k': all_kv_k.to(engine_dtype),
-            'all_kv_v': all_kv_v.to(engine_dtype),
-            'all_kv_seq_lens': new_local_end.to(torch.int64),
-            'all_local_start_indices': correct_local_start.to(torch.int64),
-            'all_crossattn_k': all_cross_k.to(engine_dtype),
-            'all_crossattn_v': all_cross_v.to(engine_dtype),
-        }
-        
-        # Run TRT engine — split batch if B > 1 (engine built with static B=1).
-        # The pipeline batches multiple denoising steps together, but the engine
-        # can only process one batch item at a time.
-        if B > 1:
-            batch_outputs = []
-            for b in range(B):
-                single_inputs = {k: v[b:b+1] for k, v in inputs.items()}
-                batch_outputs.append(self.engine.infer(single_inputs))
-            # Concatenate all outputs along batch dimension
-            outputs = {
-                key: torch.cat([bo[key] for bo in batch_outputs], dim=0)
-                for key in batch_outputs[0]
+        batch_flow_preds = []
+        for b in range(B):
+            # Determine valid cache size for this batch item
+            max_valid = int(new_local_end[b].max().item())
+            max_valid = max(max_valid, min_cache)  # respect engine minimum
+            
+            single_inputs = {
+                'x': x[b:b+1].to(engine_dtype),
+                'timestep': input_timestep[b:b+1].to(torch.int64),
+                'current_start': current_start[b:b+1].to(torch.int64),
+                'all_kv_k': all_kv_k[b:b+1, :, :max_valid].to(engine_dtype),
+                'all_kv_v': all_kv_v[b:b+1, :, :max_valid].to(engine_dtype),
+                'all_kv_seq_lens': new_local_end[b:b+1].to(torch.int64),
+                'all_local_start_indices': correct_local_start[b:b+1].to(torch.int64),
+                'all_crossattn_k': all_cross_k[b:b+1].to(engine_dtype),
+                'all_crossattn_v': all_cross_v[b:b+1].to(engine_dtype),
             }
-        else:
-            outputs = self.engine.infer(inputs)
+            
+            result = self.engine.infer(single_inputs)
+            batch_flow_preds.append(result['output'])
+            
+            # Write trimmed KV output back to full-size pipeline cache
+            out_k = result['out_kv_k']  # [1, L, max_valid, N, D]
+            out_v = result['out_kv_v']
+            if kv_cache is not None:
+                for i, cache_entry in enumerate(kv_cache):
+                    cache_entry['k'][b, :max_valid] = out_k[0, i, :max_valid].to(
+                        cache_entry['k'].dtype)
+                    cache_entry['v'][b, :max_valid] = out_v[0, i, :max_valid].to(
+                        cache_entry['v'].dtype)
+                    cache_entry['local_end_index'][b] = new_local_end[b, i]
+                    cache_entry['global_end_index'][b] = current_end[b]
+        
+        # Combine flow predictions from all batch items
+        flow_pred_combined = torch.cat(batch_flow_preds, dim=0)
         
         # Extract flow prediction and permute back: [B, C, F, H, W] -> [B, F, C, H, W]
-        flow_pred = outputs['output'].permute(0, 2, 1, 3, 4).to(
+        flow_pred = flow_pred_combined.permute(0, 2, 1, 3, 4).to(
             noisy_image_or_video.dtype)
-        
-        # Write updated KV cache back to pipeline format.
-        # Use correct indices: local_end = new_local_end, global_end = current_end
-        # (matching the original model's behavior at causal_model.py:198-199)
-        self._kv_to_pipeline_cache(
-            kv_cache, outputs['out_kv_k'], outputs['out_kv_v'],
-            new_local_end, ce.expand_as(new_local_end))
         
         # Convert flow prediction to x0 (stays in PyTorch)
         pred_x0 = self._convert_flow_pred_to_x0(
