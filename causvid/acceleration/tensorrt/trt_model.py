@@ -262,23 +262,33 @@ class TRTSelfAttention(nn.Module):
         
         # Update seq_len
         kv_seq_len = write_end.unsqueeze(0)  # [1]
-        
-        # Attend: Q over full cache up to kv_seq_len
         cache_len = kv_seq_len[0]
         
-        # Transpose for SDPA: [B, N, S, D] and [B, N, cache_len, D]
-        q_sdpa = q.transpose(1, 2)            # [B, N, S, D]
-        k_sdpa = kv_k[:, :cache_len].transpose(1, 2)  # [B, N, cache_len, D]
-        v_sdpa = kv_v[:, :cache_len].transpose(1, 2)   # [B, N, cache_len, D]
+        # === TRT-safe attention: full cache + mask (no dynamic tensor sizes) ===
+        # Dynamic slicing (kv_k[:, :cache_len]) causes TRT reshape failures
+        # because TRT can't handle zero-volume tensors during shape inference.
+        # Instead, attend over the FULL cache with an attention mask that
+        # zeros out invalid (not-yet-written) positions.
+        max_cache_size = kv_k.shape[1]  # fixed at trace time
         
-        # Create causal mask: each query position can attend to all KV positions
-        # up to its own position in the cache. In streaming mode, the query
-        # tokens are the NEW tokens, and all cached tokens came before them,
-        # so all cached tokens are attendable (causal is already satisfied).
-        # We use is_causal=False since KV cache already enforces causality.
+        q_sdpa = q.transpose(1, 2)             # [B, N, S, D]
+        k_sdpa = kv_k.transpose(1, 2)          # [B, N, max_cache_size, D]
+        v_sdpa = kv_v.transpose(1, 2)           # [B, N, max_cache_size, D]
+        
+        # Build attention mask: valid where position < cache_len
+        # Shape [1, 1, 1, max_cache_size] — broadcasts over [B, N, S, max_cache_size]
+        positions = torch.arange(max_cache_size, device=kv_k.device, dtype=torch.long)
+        valid = (positions < cache_len)  # [max_cache_size] bool
+        # Convert to additive mask: 0.0 for valid, -65504 for invalid (fp16 min)
+        attn_mask = torch.where(
+            valid.view(1, 1, 1, -1),
+            torch.zeros(1, device=kv_k.device, dtype=q_sdpa.dtype),
+            torch.full((1,), -65504.0, device=kv_k.device, dtype=q_sdpa.dtype),
+        )  # [1, 1, 1, max_cache_size]
+        
         out = F.scaled_dot_product_attention(
             q_sdpa, k_sdpa, v_sdpa,
-            attn_mask=None,
+            attn_mask=attn_mask,
             is_causal=False,
             dropout_p=0.0,
         )  # [B, N, S, D]
