@@ -269,11 +269,12 @@ class TRTWanDiffusionWrapper(nn.Module):
             _cs = single_inputs['current_start'].item()
             _ts = single_inputs['timestep'].item()
             _cache = max_valid
-            logger.info(
+            print(
                 f"[DIAG] b={b} cs={_cs} ts={_ts} cache={_cache} | "
                 f"x_in: mean={_x_in.mean():.5f} std={_x_in.std():.5f} | "
                 f"flow: mean={_flow.mean():.5f} std={_flow.std():.5f} "
-                f"min={_flow.min():.5f} max={_flow.max():.5f}"
+                f"min={_flow.min():.5f} max={_flow.max():.5f}",
+                flush=True
             )
             
             # Write trimmed KV output back to full-size pipeline cache
