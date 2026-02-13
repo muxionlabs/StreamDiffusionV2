@@ -250,41 +250,42 @@ class TRTSelfAttention(nn.Module):
                            rope_cos_h, rope_sin_h, rope_cos_w, rope_sin_w,
                            start_frame=start_frame)
         
-        # Write new K,V to cache at local_start_index
-        # For B=1 in streaming mode:
+        # === TRT-safe KV cache write using scatter (no dynamic-sized intermediates) ===
+        # The standard approach `kv_k[0, write_start:write_end] = k[0, :S]` creates
+        # dynamic-sized tensors in ONNX (ScatterND decomposition) that TRT can't
+        # handle. Instead, use scatter with explicit indices — the OUTPUT always has
+        # the same fixed shape as kv_k, avoiding reshape failures.
         write_start = local_start_index[0]  # scalar tensor
         write_end = write_start + S
         
-        kv_k = kv_k.clone()
-        kv_v = kv_v.clone()
-        kv_k[0, write_start:write_end] = k[0, :S]
-        kv_v[0, write_start:write_end] = v[0, :S]
+        # Build scatter indices: position s in k → cache position (write_start + s)
+        # torch.arange(k.shape[1]) traces as ONNX Range with dynamic limit from Shape
+        s_indices = torch.arange(k.shape[1], device=k.device, dtype=torch.long)
+        s_indices = s_indices + write_start  # [S] values: [write_start .. write_end-1]
+        # Expand to match k shape [B, S, N, D] for scatter on dim=1
+        s_indices = s_indices.view(1, -1, 1, 1).expand_as(k)
+        
+        # scatter produces output with same shape as kv_k (FIXED size) — TRT-safe
+        kv_k = kv_k.scatter(1, s_indices, k)
+        kv_v = kv_v.scatter(1, s_indices, v)
         
         # Update seq_len
         kv_seq_len = write_end.unsqueeze(0)  # [1]
         cache_len = kv_seq_len[0]
         
         # === TRT-safe attention: full cache + mask (no dynamic tensor sizes) ===
-        # Dynamic slicing (kv_k[:, :cache_len]) causes TRT reshape failures
-        # because TRT can't handle zero-volume tensors during shape inference.
-        # Instead, attend over the FULL cache with an attention mask that
-        # zeros out invalid (not-yet-written) positions.
-        max_cache_size = kv_k.shape[1]  # fixed at trace time
+        max_cache_size = kv_k.shape[1]  # dynamic via Shape op
         
         q_sdpa = q.transpose(1, 2)             # [B, N, S, D]
         k_sdpa = kv_k.transpose(1, 2)          # [B, N, max_cache_size, D]
-        v_sdpa = kv_v.transpose(1, 2)           # [B, N, max_cache_size, D]
+        v_sdpa = kv_v.transpose(1, 2)          # [B, N, max_cache_size, D]
         
-        # Build attention mask: valid where position < cache_len
-        # Shape [1, 1, 1, max_cache_size] — broadcasts over [B, N, S, max_cache_size]
+        # Attention mask: 0.0 for valid positions (< cache_len), -65504 for invalid
         positions = torch.arange(max_cache_size, device=kv_k.device, dtype=torch.long)
-        valid = (positions < cache_len)  # [max_cache_size] bool
-        # Convert to additive mask: 0.0 for valid, -65504 for invalid (fp16 min)
-        attn_mask = torch.where(
-            valid.view(1, 1, 1, -1),
-            torch.zeros(1, device=kv_k.device, dtype=q_sdpa.dtype),
-            torch.full((1,), -65504.0, device=kv_k.device, dtype=q_sdpa.dtype),
-        )  # [1, 1, 1, max_cache_size]
+        valid = (positions < cache_len).to(dtype=q_sdpa.dtype)  # [max_cache_size] 1.0/0.0
+        # (1 - valid) * -65504 gives 0 for valid, -65504 for invalid
+        attn_mask = (1.0 - valid) * (-65504.0)
+        attn_mask = attn_mask.view(1, 1, 1, -1)  # [1, 1, 1, max_cache_size]
         
         out = F.scaled_dot_product_attention(
             q_sdpa, k_sdpa, v_sdpa,
