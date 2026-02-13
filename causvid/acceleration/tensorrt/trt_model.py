@@ -35,22 +35,27 @@ def precompute_rope_freqs_real(max_seq_len: int, head_dim: int, theta: float = 1
     Precompute RoPE frequencies in sin/cos real format (no complex numbers).
     Returns cos and sin tensors for temporal, height, and width axes.
     
-    Each axis gets its own frequency range computed independently.
+    Computes full-dim frequencies first, then splits — matching the original
+    PyTorch model's rope_params(max_seq_len, head_dim) + rope_apply split.
     """
     d = head_dim
     c = d // 2  # half head dim for complex pairs
     
-    # Match the original rope_params split
-    c_t = c - 2 * (c // 3)  # temporal freq dims
-    c_h = c // 3             # height freq dims
-    c_w = c // 3             # width freq dims
+    # Match the original rope_params split sizes
+    c_t = c - 2 * (c // 3)  # temporal freq dims (22 for head_dim=128)
+    c_h = c // 3             # height freq dims  (21 for head_dim=128)
+    c_w = c // 3             # width freq dims   (21 for head_dim=128)
     
-    # Compute freqs for each axis
-    freqs_t = rope_params(max_seq_len, 2 * c_t)  # [max_seq_len, c_t] complex
-    freqs_h = rope_params(max_seq_len, 2 * c_h)  # [max_seq_len, c_h] complex
-    freqs_w = rope_params(max_seq_len, 2 * c_w)  # [max_seq_len, c_w] complex
+    # Compute FULL frequencies matching rope_params(max_seq_len, head_dim)
+    # This gives [max_seq_len, c] complex with inv_freq[k] = 1/theta^(2k/head_dim)
+    full_freqs = rope_params(max_seq_len, head_dim)  # [max_seq_len, c] complex
     
-    # Convert complex to cos/sin pairs
+    # Split identically to rope_apply: [c_t, c_h, c_w]
+    freqs_t = full_freqs[:, :c_t]            # [max_seq_len, c_t]
+    freqs_h = full_freqs[:, c_t:c_t + c_h]   # [max_seq_len, c_h]
+    freqs_w = full_freqs[:, c_t + c_h:]       # [max_seq_len, c_w]
+    
+    # Convert complex exp(i*angle) -> (cos, sin) pairs
     cos_t = freqs_t.real.float()  # [max_seq_len, c_t]
     sin_t = freqs_t.imag.float()
     cos_h = freqs_h.real.float()  # [max_seq_len, c_h]

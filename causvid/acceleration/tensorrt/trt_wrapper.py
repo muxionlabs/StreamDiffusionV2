@@ -263,20 +263,6 @@ class TRTWanDiffusionWrapper(nn.Module):
             result = self.engine.infer(single_inputs)
             batch_flow_preds.append(result['output'])
             
-            # === DIAGNOSTIC: per-frame temporal signal trace ===
-            _flow = result['output']
-            _x_in = single_inputs['x']
-            _cs = single_inputs['current_start'].item()
-            _ts = single_inputs['timestep'].item()
-            _cache = max_valid
-            print(
-                f"[DIAG] b={b} cs={_cs} ts={_ts} cache={_cache} | "
-                f"x_in: mean={_x_in.mean():.5f} std={_x_in.std():.5f} | "
-                f"flow: mean={_flow.mean():.5f} std={_flow.std():.5f} "
-                f"min={_flow.min():.5f} max={_flow.max():.5f}",
-                flush=True
-            )
-            
             # Write trimmed KV output back to full-size pipeline cache
             out_k = result['out_kv_k']  # [1, L, max_valid, N, D]
             out_v = result['out_kv_v']
