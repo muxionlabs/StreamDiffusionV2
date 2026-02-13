@@ -264,7 +264,7 @@ class TRTWanDiffusionWrapper(nn.Module):
         # (matching the original model's behavior at causal_model.py:198-199)
         self._kv_to_pipeline_cache(
             kv_cache, outputs['out_kv_k'], outputs['out_kv_v'],
-            new_local_end, ce)
+            new_local_end, ce.expand_as(new_local_end))
         
         # Convert flow prediction to x0 (stays in PyTorch)
         pred_x0 = self._convert_flow_pred_to_x0(
