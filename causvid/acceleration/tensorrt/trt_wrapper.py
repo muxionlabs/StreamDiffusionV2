@@ -202,6 +202,14 @@ class TRTWanDiffusionWrapper(nn.Module):
         if crossattn_cache is not None and not crossattn_cache[0]['is_init']:
             self._precompute_crossattn_kv(context, crossattn_cache)
         
+        # === Cache eviction ===
+        # The original CausalWanModel evicts old entries when the cache would
+        # overflow (causal_model.py:170-188). Sink tokens (first sink_size
+        # frames) are always preserved; the oldest non-sink entries are
+        # discarded to make room for new entries.
+        frame_seq_len = self.engine.metadata.get('frame_seq_len', 1560)
+        self._maybe_evict_cache(kv_cache, current_end, B, frame_seq_len)
+        
         # Convert KV cache from pipeline format to flat tensors
         all_kv_k, all_kv_v, all_global_end, all_local_end = \
             self._kv_from_pipeline_cache(kv_cache, B)
@@ -278,6 +286,62 @@ class TRTWanDiffusionWrapper(nn.Module):
     # =========================================================================
     # KV Cache Conversion: Pipeline dict format <-> TRT flat tensor format
     # =========================================================================
+    
+    def _maybe_evict_cache(self, kv_cache, current_end, batch_size,
+                           frame_seq_len):
+        """
+        Evict old KV cache entries when the cache would overflow.
+        
+        Matches the original CausalWanModel eviction (causal_model.py:170-188):
+        - Sink tokens (first sink_size frames) are always preserved
+        - Oldest non-sink entries are discarded to make room
+        - local_end_index is adjusted; global_end_index tracks logical position
+        
+        This operates IN-PLACE on the pipeline-format cache dicts.
+        """
+        if kv_cache is None:
+            return
+        
+        max_cache_len = kv_cache[0]['k'].shape[1]
+        sink_size = 3  # match original CausalWanModel.sink_size
+        sink_tokens = sink_size * frame_seq_len
+        
+        for layer_entry in kv_cache:
+            local_end = layer_entry['local_end_index']   # [B]
+            global_end = layer_entry['global_end_index']  # [B]
+            
+            for b in range(batch_size):
+                le = local_end[b].item()
+                ge = global_end[b].item()
+                ce = current_end[b].item() if current_end.dim() > 0 else current_end.item()
+                
+                # new_local_end if we wrote without eviction
+                new_le = le + ce - ge
+                
+                if new_le > max_cache_len:
+                    # Eviction needed: shift cache left by num_evicted,
+                    # keeping sink_tokens at the start
+                    num_evicted = new_le - max_cache_len + frame_seq_len
+                    num_rolled = le - num_evicted - sink_tokens
+                    
+                    if num_rolled > 0:
+                        layer_entry['k'][b, sink_tokens:sink_tokens + num_rolled] = \
+                            layer_entry['k'][b, sink_tokens + num_evicted:
+                                             sink_tokens + num_evicted + num_rolled].clone()
+                        layer_entry['v'][b, sink_tokens:sink_tokens + num_rolled] = \
+                            layer_entry['v'][b, sink_tokens + num_evicted:
+                                             sink_tokens + num_evicted + num_rolled].clone()
+                    
+                    # Zero out evicted region
+                    new_local_end = le - num_evicted
+                    layer_entry['k'][b, new_local_end:] = 0
+                    layer_entry['v'][b, new_local_end:] = 0
+                    
+                    # Update indices
+                    layer_entry['local_end_index'][b] = new_local_end
+                    # global_end reflects the logical position before eviction
+                    # (kept at current value — the formula in forward() uses the
+                    # delta current_end - global_end, which stays correct)
     
     def _kv_from_pipeline_cache(self, kv_cache, batch_size):
         """
