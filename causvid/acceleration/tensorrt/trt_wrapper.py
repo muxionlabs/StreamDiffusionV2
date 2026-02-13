@@ -141,6 +141,35 @@ class TRTWanDiffusionWrapper(nn.Module):
         Returns:
             pred_x0: [B, F, C, H, W] — denoised prediction
         """
+        num_input_frames = noisy_image_or_video.shape[1]
+        
+        # === Multi-frame sequential processing ===
+        # The TRT engine was traced with num_frames=1, so internal reshapes
+        # have num_frames baked as 1. When prepare() sends 2+ frames, we
+        # process each frame sequentially — mathematically equivalent for a
+        # causal model since each frame only attends to previous frames via
+        # the KV cache.
+        if num_input_frames > 1:
+            frame_seq_len = self.engine.metadata.get('frame_seq_len', 1560)
+            all_pred_x0 = []
+            
+            for f in range(num_input_frames):
+                single_frame = noisy_image_or_video[:, f:f+1]  # [B, 1, C, H, W]
+                single_ts = timestep[:, f:f+1]                  # [B, 1]
+                frame_start = current_start + f * frame_seq_len
+                frame_end = frame_start + frame_seq_len
+                
+                # Recursive call processes 1 frame, updates KV cache in-place
+                pred_x0 = self.forward(
+                    single_frame, conditional_dict, single_ts,
+                    kv_cache, crossattn_cache,
+                    frame_start, frame_end,
+                )
+                all_pred_x0.append(pred_x0)
+            
+            return torch.cat(all_pred_x0, dim=1)  # [B, F, C, H, W]
+        
+        # === Single-frame processing (normal path) ===
         prompt_embeds = conditional_dict["prompt_embeds"]
         
         # timestep handling (same as original)
