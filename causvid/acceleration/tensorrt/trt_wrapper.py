@@ -203,16 +203,28 @@ class TRTWanDiffusionWrapper(nn.Module):
             self._precompute_crossattn_kv(context, crossattn_cache)
         
         # Convert KV cache from pipeline format to flat tensors
-        all_kv_k, all_kv_v, all_kv_seq_lens, all_local_start_indices = \
+        all_kv_k, all_kv_v, all_global_end, all_local_end = \
             self._kv_from_pipeline_cache(kv_cache, B)
         
         # Convert cross-attn cache to flat tensors
         all_cross_k, all_cross_v = self._crossattn_from_pipeline_cache(
             crossattn_cache, B)
         
-        # Build engine input dict — only include inputs the engine expects.
-        # Note: 'context' and 'current_end' are NOT engine inputs (context is
-        # handled via pre-computed cross-attn KV; current_end is unused).
+        # === Compute correct KV cache write position ===
+        # The original CausalWanModel uses:
+        #   new_local_end = local_end + current_end - global_end
+        #   local_start   = new_local_end - num_new_tokens
+        # This allows OVERWRITING cache positions during multi-step denoising
+        # (when current_end == global_end, the delta is 0 → same positions).
+        # Without this formula, the cache only grows (append-only) and
+        # multi-step denoising corrupts the output.
+        frame_seq_len = self.engine.metadata.get('frame_seq_len', 1560)
+        # current_end: [B] → [B, 1] for broadcasting with [B, num_layers]
+        ce = current_end.unsqueeze(1).to(all_local_end.dtype)
+        new_local_end = all_local_end + ce - all_global_end  # [B, L]
+        correct_local_start = torch.clamp(new_local_end - frame_seq_len, min=0)
+        
+        # Build engine input dict
         engine_dtype = torch.float16
         
         inputs = {
@@ -221,8 +233,8 @@ class TRTWanDiffusionWrapper(nn.Module):
             'current_start': current_start.to(torch.int64),
             'all_kv_k': all_kv_k.to(engine_dtype),
             'all_kv_v': all_kv_v.to(engine_dtype),
-            'all_kv_seq_lens': all_kv_seq_lens.to(torch.int64),
-            'all_local_start_indices': all_local_start_indices.to(torch.int64),
+            'all_kv_seq_lens': new_local_end.to(torch.int64),
+            'all_local_start_indices': correct_local_start.to(torch.int64),
             'all_crossattn_k': all_cross_k.to(engine_dtype),
             'all_crossattn_v': all_cross_v.to(engine_dtype),
         }
@@ -247,10 +259,12 @@ class TRTWanDiffusionWrapper(nn.Module):
         flow_pred = outputs['output'].permute(0, 2, 1, 3, 4).to(
             noisy_image_or_video.dtype)
         
-        # Write updated KV cache back to pipeline format
+        # Write updated KV cache back to pipeline format.
+        # Use correct indices: local_end = new_local_end, global_end = current_end
+        # (matching the original model's behavior at causal_model.py:198-199)
         self._kv_to_pipeline_cache(
             kv_cache, outputs['out_kv_k'], outputs['out_kv_v'],
-            outputs['out_kv_seq_lens'])
+            new_local_end, ce)
         
         # Convert flow prediction to x0 (stays in PyTorch)
         pred_x0 = self._convert_flow_pred_to_x0(
@@ -309,8 +323,15 @@ class TRTWanDiffusionWrapper(nn.Module):
         
         return all_k, all_v, all_seq_lens, all_local_starts
     
-    def _kv_to_pipeline_cache(self, kv_cache, out_kv_k, out_kv_v, out_kv_seq_lens):
-        """Write flat TRT KV tensors back to pipeline's list-of-dicts format."""
+    def _kv_to_pipeline_cache(self, kv_cache, out_kv_k, out_kv_v,
+                              new_local_end, new_global_end):
+        """
+        Write flat TRT KV tensors back to pipeline's list-of-dicts format.
+        
+        Uses correctly computed local_end and global_end indices (matching
+        the original CausalWanModel's formula) rather than the engine's
+        raw output seq_lens.
+        """
         if kv_cache is None:
             return
         
@@ -318,12 +339,8 @@ class TRTWanDiffusionWrapper(nn.Module):
             cache_len = cache_entry['k'].shape[1]
             cache_entry['k'] = out_kv_k[:, i, :cache_len].to(cache_entry['k'].dtype)
             cache_entry['v'] = out_kv_v[:, i, :cache_len].to(cache_entry['v'].dtype)
-            if out_kv_seq_lens.dim() >= 2:
-                cache_entry['global_end_index'] = out_kv_seq_lens[:, i]
-                cache_entry['local_end_index'] = out_kv_seq_lens[:, i]
-            else:
-                cache_entry['global_end_index'] = out_kv_seq_lens
-                cache_entry['local_end_index'] = out_kv_seq_lens
+            cache_entry['local_end_index'] = new_local_end[:, i]
+            cache_entry['global_end_index'] = new_global_end[:, i]
     
     def _crossattn_from_pipeline_cache(self, crossattn_cache, batch_size):
         """Convert pipeline cross-attn cache to flat tensors."""
