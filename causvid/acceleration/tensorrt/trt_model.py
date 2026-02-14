@@ -34,48 +34,43 @@ def precompute_rope_freqs_real(max_seq_len: int, head_dim: int, theta: float = 1
     """
     Precompute RoPE frequencies in sin/cos real format (no complex numbers).
     Returns cos and sin tensors for temporal, height, and width axes.
-    
-    FULL-DIM approach (matches original model exactly):
-    All frequency bands come from a single rope_params(max_seq_len, head_dim) call,
-    then split into temporal [0:c_t], height [c_t:c_t+c_h], width [c_t+c_h:] —
-    exactly how the original CausalWanModel computes freqs and splits them.
     """
     d = head_dim
     c = d // 2  # half head dim for complex pairs
     
-    # Match the original rope_params split sizes
     c_t = c - 2 * (c // 3)  # temporal freq dims (22 for head_dim=128)
     c_h = c // 3             # height freq dims  (21 for head_dim=128)
     c_w = c // 3             # width freq dims   (21 for head_dim=128)
     
-    # Clamped RoPE Approach:
-    # 1. Generate Full-Dim Frequencies (Correct Scale).
-    # 2. Clamp values < 1e-4 to 1e-4.
-    #    - FP16 min normal is 6e-5. Subnormals are risky in TRT.
-    #    - Indices 0-32 are > 1e-4 (Safe).
-    #    - Indices 33-64 are < 1e-4 (Unsafe).
-    #    - Height Band (22-43) is half-safe, half-unsafe.
-    #    - Width Band (43-64) is all-unsafe.
-    # By clamping, we prevent "Green Grass" (underflow) while keeping frequencies
-    # as low as possible (preserving "Zoom" scale better than replacing with High Freqs).
+    # Manual RoPE calculation to allow Clamping on scalar frequencies
+    # (torch.clamp not supported for complex types)
     
-    full_freqs = rope_params(max_seq_len, head_dim)  # [max_seq_len, c]
+    # 1. Compute inverse frequencies (High -> Low)
+    # Logic matches original rope_params: 1.0 / theta^(2k/d)
+    freqs_indices = torch.arange(0, d, 2, dtype=torch.float64)
+    inv_freq = 1.0 / torch.pow(theta, freqs_indices / d)
     
-    # Clamp lowest frequencies to prevent Underflow/Green Grass
-    full_freqs = torch.clamp(full_freqs, min=1e-4)
-
-    # Split using original Full-Dim logic
-    freqs_t = full_freqs[:, :c_t]
-    freqs_h = full_freqs[:, c_t:c_t+c_h]
-    freqs_w = full_freqs[:, c_t+c_h:]  # Now safe thanks to clamp
+    # 2. CLAMP to prevent underflow (Green Grass fix)
+    # Ensure no frequency is smaller than 1e-4 (FP16 safe limit)
+    # This affects only the deep tail (Width band indices 43-64)
+    inv_freq = torch.clamp(inv_freq, min=1e-4)
     
-    # Convert complex exp(i*angle) -> (cos, sin) pairs
-    cos_t = freqs_t.real.float()
-    sin_t = freqs_t.imag.float()
-    cos_h = freqs_h.real.float()
-    sin_h = freqs_h.imag.float()
-    cos_w = freqs_w.real.float()
-    sin_w = freqs_w.imag.float()
+    # 3. Create position encodings (Angles)
+    t = torch.arange(max_seq_len, dtype=torch.float64)
+    freqs = torch.outer(t, inv_freq)  # [L, c]
+    
+    # 4. Split into bands
+    freqs_t = freqs[:, :c_t]
+    freqs_h = freqs[:, c_t:c_t+c_h]
+    freqs_w = freqs[:, c_t+c_h:]
+    
+    # 5. Convert to FP32 sin/cos (TRT expects float32/16, not complex)
+    cos_t = freqs_t.cos().float()
+    sin_t = freqs_t.sin().float()
+    cos_h = freqs_h.cos().float()
+    sin_h = freqs_h.sin().float()
+    cos_w = freqs_w.cos().float()
+    sin_w = freqs_w.sin().float()
     
     return (cos_t, sin_t, cos_h, sin_h, cos_w, sin_w)
 
