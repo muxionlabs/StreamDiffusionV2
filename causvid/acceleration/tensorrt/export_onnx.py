@@ -388,6 +388,20 @@ def main():
     dtype = torch.float16 if args.fp16 else torch.float32
     model = model.to(device=args.device, dtype=dtype)
     
+    # CRITICAL: Keep RoPE buffers in float32 even when model is FP16.
+    # Full-dim spatial bands 22-42 have very small sin values (~0.001-0.007).
+    # In FP16, these get truncated, making all spatial positions indistinguishable
+    # → attention collapses → "green grass" artifact.
+    # The trt_rope_apply function already upcasts to float32 for computation,
+    # but the ONNX constants must also be float32 for the values to survive.
+    if args.fp16:
+        rope_buf_names = ['rope_cos_t', 'rope_sin_t', 'rope_cos_h', 'rope_sin_h',
+                          'rope_cos_w', 'rope_sin_w']
+        for name in rope_buf_names:
+            buf = getattr(model, name)
+            model.register_buffer(name, buf.float())
+        logger.info("Kept RoPE buffers in float32 for spatial precision")
+    
     # Load weights
     ckpt_path = os.path.join(args.checkpoint_folder, "model.pt")
     load_checkpoint_for_trt(ckpt_path, model, strict=False)
