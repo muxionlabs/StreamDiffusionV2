@@ -707,9 +707,10 @@ class TRTCausalWanModel(nn.Module):
         context = self.text_embedding(context)  # [B, text_len, dim]
         
         # 4. Compute frame start for RoPE
+        # current_start is token index. frame_len = H * W
         F_grid = grid_sizes[0, 0]
         HW = grid_sizes[0, 1] * grid_sizes[0, 2]
-        start_frame = current_start[0] // HW
+        start_frame_idx = current_start[0] // HW
         
         # 5. Run transformer blocks
         for i, block in enumerate(self.blocks):
@@ -728,7 +729,7 @@ class TRTCausalWanModel(nn.Module):
                 self.rope_cos_w, self.rope_sin_w,
                 layer_kv_k, layer_kv_v, layer_seq_len, layer_start,
                 layer_cross_k, layer_cross_v,
-                start_frame=start_frame,
+                start_frame=start_frame_idx,
             )
             
             # Write back updated cache
