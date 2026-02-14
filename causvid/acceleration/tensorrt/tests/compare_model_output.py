@@ -214,12 +214,16 @@ with torch.no_grad():
     )
 
 # TRT model frame 1 — use updated KV from frame 0
+# IMPORTANT: TRT model expects FRAME INDEX, not token index!
+# The wrapper does: current_start // frame_seq_len before calling the model
+cs1_frame = torch.tensor([1], device='cuda', dtype=torch.long)  # frame 1
+ce1_frame = torch.tensor([frame_seq_len * 2], device='cuda', dtype=torch.long)
 all_kv_seq1 = out_kv_seq  # Updated after frame 0
-all_kv_start1 = out_kv_seq.clone()  # local_start = local_end from prev
+all_kv_start1 = out_kv_seq.clone()  # local_start = local_end from prev (write position)
 with torch.no_grad():
     trt_out1, _, _, _ = trt_model(
         x1_raw, ts1_BF, raw_context,
-        cs1, ce1,
+        cs1_frame, ce1_frame,
         out_kv_k, out_kv_v, all_kv_seq1, all_kv_start1,
         all_cross_k, all_cross_v,
     )
