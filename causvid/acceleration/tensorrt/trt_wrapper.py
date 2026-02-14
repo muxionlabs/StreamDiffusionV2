@@ -264,6 +264,21 @@ class TRTWanDiffusionWrapper(nn.Module):
                 'all_crossattn_v': all_cross_v[b:b+1].to(engine_dtype),
             }
             
+            # === DIAGNOSTIC LOGGING (remove after debugging) ===
+            _frame_idx = int((current_start[b] // frame_seq_len).item())
+            _token_idx = int(current_start[b].item())
+            _local_start = int(correct_local_start[b].max().item())
+            _timestep = int(input_timestep[b].item())
+            if not hasattr(self, '_diag_call_count'):
+                self._diag_call_count = 0
+            self._diag_call_count += 1
+            if self._diag_call_count <= 30:  # first 30 calls only
+                print(f"[TRT_DIAG] call={self._diag_call_count} b={b} "
+                      f"token_start={_token_idx} frame_idx={_frame_idx} "
+                      f"cache_size={max_valid} local_start={_local_start} "
+                      f"timestep={_timestep}")
+            # === END DIAGNOSTIC ===
+            
             result = self.engine.infer(single_inputs)
             batch_flow_preds.append(result['output'])
             

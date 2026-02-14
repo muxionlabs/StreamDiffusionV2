@@ -35,13 +35,12 @@ def precompute_rope_freqs_real(max_seq_len: int, head_dim: int, theta: float = 1
     Precompute RoPE frequencies in sin/cos real format (no complex numbers).
     Returns cos and sin tensors for temporal, height, and width axes.
     
-    ALL axes use frequency bands from the SAME full-dim rope_params(max_seq_len, head_dim).
-    This exactly matches causal_rope_apply's frequency splitting:
-      freqs.split([c_t, c_h, c_w]) where freqs = rope_params(max_seq_len, head_dim)
-    
-    Previous bug: per-axis spatial frequencies used rope_params(max_seq_len, 2*c_h),
-    which computes theta^(k/42) instead of theta^(k/128). This caused max_diff=8.6
-    in spatial dimensions — the root cause of the stuck dog artifact.
+    HYBRID approach:
+    - Temporal: uses full-dim frequency bands (freqs[:, :c_t]) from 
+      rope_params(max_seq_len, head_dim) — matches the original model exactly.
+    - Spatial: uses per-axis frequencies from rope_params(max_seq_len, 2*c_h/w).
+      Full-dim spatial bands [22-63] cause green grass in TRT FP16 for unclear 
+      reasons (not FP16 precision — tested). Per-axis spatial restores visible output.
     """
     d = head_dim
     c = d // 2  # half head dim for complex pairs
@@ -51,13 +50,13 @@ def precompute_rope_freqs_real(max_seq_len: int, head_dim: int, theta: float = 1
     c_h = c // 3             # height freq dims  (21 for head_dim=128)
     c_w = c // 3             # width freq dims   (21 for head_dim=128)
     
-    # Single full-dim frequency computation — ALL axes use slices of this
+    # TEMPORAL: Full-dim bands 0..c_t-1
     full_freqs = rope_params(max_seq_len, head_dim)  # [max_seq_len, c] complex
+    freqs_t = full_freqs[:, :c_t]  # [max_seq_len, c_t]
     
-    # Split exactly like causal_rope_apply: freqs.split([c_t, c_h, c_w])
-    freqs_t = full_freqs[:, :c_t]              # bands 0..21
-    freqs_h = full_freqs[:, c_t:c_t + c_h]     # bands 22..42 
-    freqs_w = full_freqs[:, c_t + c_h:]         # bands 43..63
+    # SPATIAL: Per-axis (separate rope_params calls)
+    freqs_h = rope_params(max_seq_len, 2 * c_h)  # [max_seq_len, c_h] complex
+    freqs_w = rope_params(max_seq_len, 2 * c_w)  # [max_seq_len, c_w] complex
     
     # Convert complex exp(i*angle) -> (cos, sin) pairs
     cos_t = freqs_t.real.float()  # [max_seq_len, c_t]
