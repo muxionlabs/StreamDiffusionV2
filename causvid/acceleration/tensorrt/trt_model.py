@@ -35,12 +35,10 @@ def precompute_rope_freqs_real(max_seq_len: int, head_dim: int, theta: float = 1
     Precompute RoPE frequencies in sin/cos real format (no complex numbers).
     Returns cos and sin tensors for temporal, height, and width axes.
     
-    HYBRID approach:
-    - Temporal: uses full-dim frequency bands (freqs[:, :c_t]) from 
-      rope_params(max_seq_len, head_dim) — matches the original model exactly.
-    - Spatial: uses per-axis frequencies from rope_params(max_seq_len, 2*c_h/w).
-      Full-dim spatial bands [22-63] cause green grass in TRT FP16 for unclear 
-      reasons (not FP16 precision — tested). Per-axis spatial restores visible output.
+    FULL-DIM approach (matches original model exactly):
+    All frequency bands come from a single rope_params(max_seq_len, head_dim) call,
+    then split into temporal [0:c_t], height [c_t:c_t+c_h], width [c_t+c_h:] —
+    exactly how the original CausalWanModel computes freqs and splits them.
     """
     d = head_dim
     c = d // 2  # half head dim for complex pairs
@@ -50,13 +48,11 @@ def precompute_rope_freqs_real(max_seq_len: int, head_dim: int, theta: float = 1
     c_h = c // 3             # height freq dims  (21 for head_dim=128)
     c_w = c // 3             # width freq dims   (21 for head_dim=128)
     
-    # TEMPORAL: Full-dim bands 0..c_t-1
+    # Single rope_params call → split by axis (matches original model)
     full_freqs = rope_params(max_seq_len, head_dim)  # [max_seq_len, c] complex
-    freqs_t = full_freqs[:, :c_t]  # [max_seq_len, c_t]
-    
-    # SPATIAL: Per-axis (separate rope_params calls)
-    freqs_h = rope_params(max_seq_len, 2 * c_h)  # [max_seq_len, c_h] complex
-    freqs_w = rope_params(max_seq_len, 2 * c_w)  # [max_seq_len, c_w] complex
+    freqs_t = full_freqs[:, :c_t]                     # [max_seq_len, c_t]
+    freqs_h = full_freqs[:, c_t:c_t+c_h]             # [max_seq_len, c_h]
+    freqs_w = full_freqs[:, c_t+c_h:]                 # [max_seq_len, c_w]
     
     # Convert complex exp(i*angle) -> (cos, sin) pairs
     cos_t = freqs_t.real.float()  # [max_seq_len, c_t]
