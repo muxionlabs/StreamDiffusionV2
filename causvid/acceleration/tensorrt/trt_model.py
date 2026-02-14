@@ -706,11 +706,10 @@ class TRTCausalWanModel(nn.Module):
         # 3. Text embedding (applies the MLP)
         context = self.text_embedding(context)  # [B, text_len, dim]
         
-        # 4. Compute frame start for RoPE
-        # current_start is token index. frame_len = H * W
-        F_grid = grid_sizes[0, 0]
-        HW = grid_sizes[0, 1] * grid_sizes[0, 2]
-        start_frame_idx = current_start[0] // HW
+        # 4. current_start is the FRAME INDEX (computed in trt_wrapper.py)
+        # No division needed here — trt_wrapper converts token index to frame index
+        # before passing to the engine.
+        start_frame_idx = current_start[0]
         
         # 5. Run transformer blocks
         for i, block in enumerate(self.blocks):

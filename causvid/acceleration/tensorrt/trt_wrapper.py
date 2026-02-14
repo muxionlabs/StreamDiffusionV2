@@ -251,7 +251,11 @@ class TRTWanDiffusionWrapper(nn.Module):
             single_inputs = {
                 'x': x[b:b+1].to(engine_dtype),
                 'timestep': input_timestep[b:b+1].to(torch.int64),
-                'current_start': current_start[b:b+1].to(torch.int64),
+                # Convert token index to frame index for RoPE offset.
+                # current_start is token offset (0, 1560, 3120...).
+                # The engine's trt_model treats current_start as frame index.
+                # Original CausalWanModel: current_start_frame = current_start // frame_seqlen
+                'current_start': (current_start[b:b+1] // frame_seq_len).to(torch.int64),
                 'all_kv_k': all_kv_k[b:b+1, :, :max_valid].to(engine_dtype),
                 'all_kv_v': all_kv_v[b:b+1, :, :max_valid].to(engine_dtype),
                 'all_kv_seq_lens': new_local_end[b:b+1].to(torch.int64),
