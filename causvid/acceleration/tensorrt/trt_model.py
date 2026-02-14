@@ -48,21 +48,33 @@ def precompute_rope_freqs_real(max_seq_len: int, head_dim: int, theta: float = 1
     c_h = c // 3             # height freq dims  (21 for head_dim=128)
     c_w = c // 3             # width freq dims   (21 for head_dim=128)
     
-    # Per-Axis Spatial (Restores Structure)
-    # Temporal: use global params (stable)
-    freqs_t = rope_params(max_seq_len, head_dim)[:, :c_t]  # [max_seq_len, c_t]
+    # Hybrid Approach:
+    # 1. Temporal: Full-Dim (Indices 0..c_t) -> Correct weights, High Freq (Stable)
+    # 2. Height: Full-Dim (Indices c_t..c_t+c_h) -> Correct weights, Medium Freq (Stable)
+    # 3. Width: Per-Axis (Indices 0..c_w) -> INTENTIONALLY WRONG weights, High Freq (Stable)
+    #
+    # Rationale: Full-Dim Width (Indices 43-63) uses very low frequencies (~1e-5 to 1e-8).
+    # These cause "Green Grass" artifacts in FP16/TRT (underflow/aliasing).
+    # We sacrifice horizontal frequency correctness for stability, but restore vertical correctness
+    # to fix the "Stuck Dog" (hoping vertical motion is enough to drive generation).
     
-    # Spatial: use separate params for H/W to concentrate freqs in lower bands
-    # preventing high-freq aliasing/truncation in FP16/TRT
-    freqs_h = rope_params(max_seq_len, 2 * c_h)  # [max_seq_len, c_h]
-    freqs_w = rope_params(max_seq_len, 2 * c_w)  # [max_seq_len, c_w]
+    full_freqs = rope_params(max_seq_len, head_dim)  # [max_seq_len, c]
+    
+    # Time: Correct
+    freqs_t = full_freqs[:, :c_t]
+    
+    # Height: Correct (Restored from Full-Dim)
+    freqs_h = full_freqs[:, c_t:c_t+c_h]
+    
+    # Width: Per-Axis (High Frequencies for stability)
+    freqs_w = rope_params(max_seq_len, 2 * c_w)
     
     # Convert complex exp(i*angle) -> (cos, sin) pairs
-    cos_t = freqs_t.real.float()  # [max_seq_len, c_t]
+    cos_t = freqs_t.real.float()
     sin_t = freqs_t.imag.float()
-    cos_h = freqs_h.real.float()  # [max_seq_len, c_h]
+    cos_h = freqs_h.real.float()
     sin_h = freqs_h.imag.float()
-    cos_w = freqs_w.real.float()  # [max_seq_len, c_w]
+    cos_w = freqs_w.real.float()
     sin_w = freqs_w.imag.float()
     
     return (cos_t, sin_t, cos_h, sin_h, cos_w, sin_w)
