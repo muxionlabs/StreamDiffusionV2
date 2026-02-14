@@ -30,47 +30,43 @@ from causvid.models.wan.wan_base.modules.model import (
 # TRT-Safe RoPE Implementation
 # =============================================================================
 
-def precompute_rope_freqs_real(max_seq_len: int, head_dim: int, theta: float = 10000.0):
-    """
-    Precompute RoPE frequencies in sin/cos real format (no complex numbers).
-    Returns cos and sin tensors for temporal, height, and width axes.
-    """
-    d = head_dim
-    c = d // 2  # half head dim for complex pairs
+    # Scaled Per-Axis Approach:
+    # 1. Use Per-Axis Width Frequencies (Indices 0..c_w).
+    #    - These are High Frequencies (Stable).
+    #    - But they cause "Zoomed Tail" (Scale too small).
+    # 2. Divide these frequencies by a Scale Factor (e.g., 40.0).
+    #    - This shifts the effective spatial scale to be 40x larger (Wide FOV).
+    #    - Resulting frequencies are ~1e-3 (Safe in FP16).
+    #    - Avoids "Green Grass" (Underflow) from native Low Freqs.
+    #    - Avoids "Zoomed Tail" from native High Freqs.
     
-    c_t = c - 2 * (c // 3)  # temporal freq dims (22 for head_dim=128)
-    c_h = c // 3             # height freq dims  (21 for head_dim=128)
-    c_w = c // 3             # width freq dims   (21 for head_dim=128)
+    scale_factor = 40.0
     
-    # Manual RoPE calculation to allow Clamping on scalar frequencies
-    # (torch.clamp not supported for complex types)
+    # Generate standard full frequencies
+    full_freqs = rope_params(max_seq_len, head_dim)
+
+    # Time: Correct
+    freqs_t = full_freqs[:, :c_t]
     
-    # 1. Compute inverse frequencies (High -> Low)
-    # Logic matches original rope_params: 1.0 / theta^(2k/d)
-    freqs_indices = torch.arange(0, d, 2, dtype=torch.float64)
-    inv_freq = 1.0 / torch.pow(theta, freqs_indices / d)
+    # Height: Correct
+    freqs_h = full_freqs[:, c_t:c_t+c_h]
     
-    # 2. CLAMP to prevent underflow (Green Grass fix)
-    # Ensure no frequency is smaller than 1e-4 (FP16 safe limit)
-    # This affects only the deep tail (Width band indices 43-64)
-    inv_freq = torch.clamp(inv_freq, min=1e-4)
+    # Width: Per-Axis (High Freq)
+    # Re-generate to ensure we get 0..c_w indices corresponding to full_freqs magnitude
+    # But effectively we just take the first c_w columns of full_freqs
+    # (since full_freqs is sorted High->Low)
+    freqs_w = full_freqs[:, :c_w]
     
-    # 3. Create position encodings (Angles)
-    t = torch.arange(max_seq_len, dtype=torch.float64)
-    freqs = torch.outer(t, inv_freq)  # [L, c]
+    # Apply Scale Factor to Width
+    freqs_w = freqs_w / scale_factor
     
-    # 4. Split into bands
-    freqs_t = freqs[:, :c_t]
-    freqs_h = freqs[:, c_t:c_t+c_h]
-    freqs_w = freqs[:, c_t+c_h:]
-    
-    # 5. Convert to FP32 sin/cos (TRT expects float32/16, not complex)
-    cos_t = freqs_t.cos().float()
-    sin_t = freqs_t.sin().float()
-    cos_h = freqs_h.cos().float()
-    sin_h = freqs_h.sin().float()
-    cos_w = freqs_w.cos().float()
-    sin_w = freqs_w.sin().float()
+    # Convert complex exp(i*angle) -> (cos, sin) pairs
+    cos_t = freqs_t.real.float()
+    sin_t = freqs_t.imag.float()
+    cos_h = freqs_h.real.float()
+    sin_h = freqs_h.imag.float()
+    cos_w = freqs_w.real.float()
+    sin_w = freqs_w.imag.float()
     
     return (cos_t, sin_t, cos_h, sin_h, cos_w, sin_w)
 
