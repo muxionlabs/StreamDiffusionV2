@@ -49,21 +49,25 @@ def precompute_rope_freqs_real(max_seq_len: int, head_dim: int, theta: float = 1
     #    - Mapped Low (100.0x equivalent) = Green Grass (Crash).
     #    - We try 2.0x to encourage motion while staying SAFELY in the high-freq band.
     #    - Effective Range: ~0.5 to ~0.025. (Min Safe is ~0.0001).
-    
-    scale_factor = 2.0
+    # Time Shift Approach:
+    # 1. Spatial: Keep Per-Axis (Stuck Dog). Indices 0..c_h/w.
+    #    - We KNOW any scaling/mapping of Width causes Green Grass.
+    #    - So we MUST accept High Freqs for Space.
+    # 2. Time: Shift to Height Band (Indices c_t..c_t+c_t).
+    #    - Currently, Time (0..22) and Space (0..21) use the SAME frequencies.
+    #    - This collision likely makes Time look like Space -> Static Image.
+    #    - We shift Time to the next band (22..44) to differentiate it.
     
     # Generate standard full frequencies
     full_freqs = rope_params(max_seq_len, head_dim)
 
-    # Time: Correct
-    freqs_t = full_freqs[:, :c_t]
+    # Time: SHIFTED to indices [c_t : 2*c_t]
+    # (Approx indices 22 to 44)
+    freqs_t = full_freqs[:, c_t : 2*c_t]
     
-    # Height: Correct
-    freqs_h = full_freqs[:, c_t:c_t+c_h]
-    
-    # Width: Scaled Per-Axis
-    # Take high-freq band (0..c_w) and scale down conservatively
-    freqs_w = full_freqs[:, :c_w] / scale_factor
+    # Spatial: Per-Axis Baseline (Stuck Dog)
+    freqs_h = rope_params(max_seq_len, 2 * c_h)
+    freqs_w = rope_params(max_seq_len, 2 * c_w)
     
     # Convert complex exp(i*angle) -> (cos, sin) pairs
     cos_t = freqs_t.real.float()
