@@ -166,30 +166,79 @@ else:
 
 
 # ============================================
-# Test 4: KV cache sensitivity  
+# Test 4: KV cache content sensitivity (CORRECTED)
 # ============================================
-print("\n=== TEST 4: KV cache content sensitivity ===")
-inputs_kv_a = make_inputs(current_start_val=0, seed=42)
-inputs_kv_b = make_inputs(current_start_val=0, seed=42)
-# Change ONLY KV cache content
-inputs_kv_b['all_kv_k'] = torch.randn_like(inputs_kv_b['all_kv_k'])
-inputs_kv_b['all_kv_v'] = torch.randn_like(inputs_kv_b['all_kv_v'])
-# Also set seq_lens > 0 so cache is actually attended to
-inputs_kv_a['all_kv_seq_lens'] = torch.full((1, num_layers), frame_seq_len, 
-                                              device='cuda', dtype=torch.int64)
-inputs_kv_b['all_kv_seq_lens'] = torch.full((1, num_layers), frame_seq_len,
-                                              device='cuda', dtype=torch.int64)
+# With local_start=0, new tokens OVERWRITE positions 0..1559 and mask
+# everything beyond → old cache content can't matter. 
+# FIX: Set local_start=1560 so new tokens go to 1560..3119 while OLD
+# entries at 0..1559 are PRESERVED and ATTENDED to.
+print("\n=== TEST 4: KV cache content sensitivity (local_start=1560) ===")
+
+cache_size = frame_seq_len * 3  # 4680 — enough room for 3 frames
+
+def make_kv_test_inputs(kv_seed, data_seed=42):
+    """Create inputs where local_start=1560 and KV cache has one frame of data."""
+    torch.manual_seed(data_seed)
+    inputs = {}
+    for name in engine.input_names:
+        if name == 'x':
+            inputs[name] = torch.randn(1, 16, 1, H_lat, W_lat, device='cuda', dtype=torch.float16)
+        elif name == 'timestep':
+            inputs[name] = torch.tensor([[500]], device='cuda', dtype=torch.int64)
+        elif name == 'current_start':
+            inputs[name] = torch.tensor([1], device='cuda', dtype=torch.int64)  # frame 1
+        elif name == 'all_kv_k':
+            torch.manual_seed(kv_seed)  # different seed for KV content
+            inputs[name] = torch.randn(1, num_layers, cache_size, num_heads, head_dim,
+                                        device='cuda', dtype=torch.float16)
+        elif name == 'all_kv_v':
+            # Continue from kv_seed (torch state carries over)
+            inputs[name] = torch.randn(1, num_layers, cache_size, num_heads, head_dim,
+                                        device='cuda', dtype=torch.float16)
+        elif name == 'all_kv_seq_lens':
+            # NOT USED by model (overwritten by write_end) but pass anyway
+            inputs[name] = torch.full((1, num_layers), frame_seq_len, 
+                                       device='cuda', dtype=torch.int64)
+        elif name == 'all_local_start_indices':
+            # KEY: write NEW tokens at position 1560, preserving 0..1559
+            inputs[name] = torch.full((1, num_layers), frame_seq_len,
+                                       device='cuda', dtype=torch.int64)
+        elif name == 'all_crossattn_k':
+            torch.manual_seed(data_seed + 1000)
+            inputs[name] = torch.randn(1, num_layers, text_len, num_heads, head_dim,
+                                        device='cuda', dtype=torch.float16) * 0.1
+        elif name == 'all_crossattn_v':
+            inputs[name] = torch.randn(1, num_layers, text_len, num_heads, head_dim,
+                                        device='cuda', dtype=torch.float16) * 0.1
+    return inputs
+
+inputs_kv_a = make_kv_test_inputs(kv_seed=100, data_seed=42)
+inputs_kv_b = make_kv_test_inputs(kv_seed=200, data_seed=42)
+
+# Verify: same x, same current_start, different KV content
+assert torch.equal(inputs_kv_a['x'], inputs_kv_b['x']), "x should be identical"
+assert torch.equal(inputs_kv_a['current_start'], inputs_kv_b['current_start'])
+assert not torch.equal(inputs_kv_a['all_kv_k'], inputs_kv_b['all_kv_k']), "KV should differ"
+print(f"  Cache size: {cache_size}, local_start: {frame_seq_len}")
+print(f"  → New tokens at positions {frame_seq_len}..{frame_seq_len*2-1}")
+print(f"  → Old cache at positions 0..{frame_seq_len-1} should affect attention")
 
 with torch.no_grad():
     out_kv_a = engine.infer(inputs_kv_a)['output'].clone()
     out_kv_b = engine.infer(inputs_kv_b)['output'].clone()
 
 diff_kv = (out_kv_a.float() - out_kv_b.float()).abs()
+print(f"  out_kv_a norm: {out_kv_a.float().norm():.4f}")
+print(f"  out_kv_b norm: {out_kv_b.float().norm():.4f}")
 print(f"  max diff: {diff_kv.max():.6f}, mean: {diff_kv.mean():.8f}")
 if diff_kv.max() < 1e-6:
-    print("  ❌ FAIL: Engine ignores KV cache content!")
+    print("  ❌ FAIL: Engine IGNORES KV cache content even with local_start=1560!")
+    print("  → The attention mechanism cannot see previous frame context")
+    print("  → This is the ROOT CAUSE of the stuck dog!")
+elif diff_kv.max() < 0.01:
+    print("  ⚠️  Very small KV sensitivity — attention barely uses cached context")
 else:
-    print("  ✅ PASS: Engine responds to KV cache content changes")
+    print("  ✅ PASS: Engine output changes when KV cache content changes")
 
 
 # ============================================
