@@ -48,26 +48,29 @@ def precompute_rope_freqs_real(max_seq_len: int, head_dim: int, theta: float = 1
     c_h = c // 3             # height freq dims  (21 for head_dim=128)
     c_w = c // 3             # width freq dims   (21 for head_dim=128)
     
-    # Hybrid Approach:
-    # 1. Temporal: Full-Dim (Indices 0..c_t) -> Correct weights, High Freq (Stable)
-    # 2. Height: Full-Dim (Indices c_t..c_t+c_h) -> Correct weights, Medium Freq (Stable)
-    # 3. Width: Per-Axis (Indices 0..c_w) -> INTENTIONALLY WRONG weights, High Freq (Stable)
+    # Updated Hybrid Approach:
+    # 1. Temporal: Full-Dim (Indices 0..c_t) -> High Freq (Correct)
+    # 2. Height: Full-Dim (Indices c_t..c_t+c_h) -> Medium-Low Freq (Correct, Safe)
+    # 3. Width: REUSE Height Frequencies (Indices c_t..c_t+c_w) -> Medium-Low Freq (Safe Substitute)
     #
-    # Rationale: Full-Dim Width (Indices 43-63) uses very low frequencies (~1e-5 to 1e-8).
-    # These cause "Green Grass" artifacts in FP16/TRT (underflow/aliasing).
-    # We sacrifice horizontal frequency correctness for stability, but restore vertical correctness
-    # to fix the "Stuck Dog" (hoping vertical motion is enough to drive generation).
+    # Rationale:
+    # - Full-Dim Width (Indices c_t+c_h..end) uses Deep Low Frequencies (<1e-5) causing "Green Grass" (FP16 Underflow).
+    # - Per-Axis Width (Indices 0..c_w) uses High Frequencies (>1e-2) causing "Zoomed Tail" (Scale Mismatch).
+    # - Reusing Height Frequencies gives us the lowest SAFE band (1e-3 to 1e-4).
+    #   It preserves spatial structure better than clamping or random high freqs.
     
     full_freqs = rope_params(max_seq_len, head_dim)  # [max_seq_len, c]
     
     # Time: Correct
     freqs_t = full_freqs[:, :c_t]
     
-    # Height: Correct (Restored from Full-Dim)
+    # Height: Correct
     freqs_h = full_freqs[:, c_t:c_t+c_h]
     
-    # Width: Per-Axis (High Frequencies for stability)
-    freqs_w = rope_params(max_seq_len, 2 * c_w)
+    # Width: Reuse Height Frequencies (Safe Low Band)
+    # Note: c_w usually equals c_h (21/21 in dim 64, 42/42 in dim 128)
+    # If dimensions differ, we slice from the start of the height band to match c_w length
+    freqs_w = full_freqs[:, c_t:c_t+c_w]
     
     # Convert complex exp(i*angle) -> (cos, sin) pairs
     cos_t = freqs_t.real.float()
