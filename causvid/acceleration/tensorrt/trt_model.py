@@ -42,18 +42,29 @@ def precompute_rope_freqs_real(max_seq_len: int, head_dim: int, theta: float = 1
     c_h = c // 3             # height freq dims  (21 for head_dim=128)
     c_w = c // 3             # width freq dims   (21 for head_dim=128)
     
-    # REVERT TO PER-AXIS SPATIAL (STUCK DOG STATE)
-    # This was the only configuration that produced a visible dog.
-    # It uses high frequencies for spatial dims (stable in FP16), even if scale is slightly off.
+    # Scaled Per-Axis Approach (Senior Engineer Strategy):
+    # 1. Use Per-Axis Width Frequencies (Indices 0..c_w).
+    #    - These are High Frequencies (~1.0 to ~0.01). Stable in FP16.
+    #    - Native High Freqs caused "Stuck Dog" (Static).
+    # 2. Divide by Factor 100.0.
+    #    - Shifts effective range to ~0.01 to ~0.0001.
+    #    - Lowest freq is ~1e-4, which is SAFE for FP16 (above 6e-5).
+    #    - Bringing frequencies lower should help temporal motion (less spatial "noise").
     
-    # Temporal: use global params (stable)
-    freqs_t = rope_params(max_seq_len, head_dim)[:, :c_t]
+    scale_factor = 100.0
     
-    # Spatial: use separate params for H/W (Per-Axis)
-    # This concentrates frequencies in the stable high-freq bands (Indices 0..21)
-    # avoiding the fatal underflow of the mapped low-freq bands.
-    freqs_h = rope_params(max_seq_len, 2 * c_h)
-    freqs_w = rope_params(max_seq_len, 2 * c_w)
+    # Generate standard full frequencies
+    full_freqs = rope_params(max_seq_len, head_dim)
+
+    # Time: Correct
+    freqs_t = full_freqs[:, :c_t]
+    
+    # Height: Correct
+    freqs_h = full_freqs[:, c_t:c_t+c_h]
+    
+    # Width: Scaled Per-Axis
+    # Take high-freq band (0..c_w) and scale down
+    freqs_w = full_freqs[:, :c_w] / scale_factor
     
     # Convert complex exp(i*angle) -> (cos, sin) pairs
     cos_t = freqs_t.real.float()
