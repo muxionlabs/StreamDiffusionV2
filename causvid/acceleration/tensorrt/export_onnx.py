@@ -388,23 +388,31 @@ def main():
     dtype = torch.float16 if args.fp16 else torch.float32
     model = model.to(device=args.device, dtype=dtype)
     
+    # Load weights
+    ckpt_path = os.path.join(args.checkpoint_folder, "model.pt")
+    load_checkpoint_for_trt(ckpt_path, model, strict=False)
+    
     # CRITICAL: Keep RoPE buffers in float32 even when model is FP16.
     # Full-dim spatial bands 22-42 have very small sin values (~0.001-0.007).
     # In FP16, these get truncated, making all spatial positions indistinguishable
     # → attention collapses → "green grass" artifact.
-    # The trt_rope_apply function already upcasts to float32 for computation,
-    # but the ONNX constants must also be float32 for the values to survive.
+    # Must be done AFTER load_checkpoint_for_trt to avoid being overwritten.
     if args.fp16:
         rope_buf_names = ['rope_cos_t', 'rope_sin_t', 'rope_cos_h', 'rope_sin_h',
                           'rope_cos_w', 'rope_sin_w']
+        # Recompute from scratch in float32 (the buffers from __init__ may have been
+        # converted to fp16 by model.to())
+        from causvid.acceleration.tensorrt.trt_model import precompute_rope_freqs_real
+        rope_freqs = precompute_rope_freqs_real(1024, model.head_dim)
+        for name, buf in zip(rope_buf_names, rope_freqs):
+            # register_buffer replaces existing buffer
+            model.register_buffer(name, buf.to(model.rope_cos_t.device))
+        
+        # Verify
         for name in rope_buf_names:
             buf = getattr(model, name)
-            model.register_buffer(name, buf.float())
-        logger.info("Kept RoPE buffers in float32 for spatial precision")
-    
-    # Load weights
-    ckpt_path = os.path.join(args.checkpoint_folder, "model.pt")
-    load_checkpoint_for_trt(ckpt_path, model, strict=False)
+            print(f"  [VERIFY] {name}: dtype={buf.dtype}, device={buf.device}")
+        print(f"  [VERIFY] RoPE buffers are float32: {model.rope_cos_t.dtype == torch.float32}")
     
     # Export
     export_to_onnx(

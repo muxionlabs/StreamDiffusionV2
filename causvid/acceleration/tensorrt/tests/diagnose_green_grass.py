@@ -56,7 +56,8 @@ except Exception as e:
 # ============================================
 print("\n=== Step 2: Python TRT model — bf16 vs fp16 with full-dim spatial ===")
 
-from causvid.acceleration.tensorrt.trt_model import TRTCausalWanModel, T2V_1_3B_CONFIG
+from causvid.acceleration.tensorrt.trt_model import TRTCausalWanModel
+from causvid.acceleration.tensorrt.export_onnx import T2V_1_3B_CONFIG
 
 model_config = T2V_1_3B_CONFIG.copy()
 
