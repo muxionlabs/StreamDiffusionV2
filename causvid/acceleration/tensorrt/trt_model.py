@@ -48,29 +48,26 @@ def precompute_rope_freqs_real(max_seq_len: int, head_dim: int, theta: float = 1
     c_h = c // 3             # height freq dims  (21 for head_dim=128)
     c_w = c // 3             # width freq dims   (21 for head_dim=128)
     
-    # Updated Hybrid Approach:
-    # 1. Temporal: Full-Dim (Indices 0..c_t) -> High Freq (Correct)
-    # 2. Height: Full-Dim (Indices c_t..c_t+c_h) -> Medium-Low Freq (Correct, Safe)
-    # 3. Width: REUSE Height Frequencies (Indices c_t..c_t+c_w) -> Medium-Low Freq (Safe Substitute)
-    #
-    # Rationale:
-    # - Full-Dim Width (Indices c_t+c_h..end) uses Deep Low Frequencies (<1e-5) causing "Green Grass" (FP16 Underflow).
-    # - Per-Axis Width (Indices 0..c_w) uses High Frequencies (>1e-2) causing "Zoomed Tail" (Scale Mismatch).
-    # - Reusing Height Frequencies gives us the lowest SAFE band (1e-3 to 1e-4).
-    #   It preserves spatial structure better than clamping or random high freqs.
+    # Clamped RoPE Approach:
+    # 1. Generate Full-Dim Frequencies (Correct Scale).
+    # 2. Clamp values < 1e-4 to 1e-4.
+    #    - FP16 min normal is 6e-5. Subnormals are risky in TRT.
+    #    - Indices 0-32 are > 1e-4 (Safe).
+    #    - Indices 33-64 are < 1e-4 (Unsafe).
+    #    - Height Band (22-43) is half-safe, half-unsafe.
+    #    - Width Band (43-64) is all-unsafe.
+    # By clamping, we prevent "Green Grass" (underflow) while keeping frequencies
+    # as low as possible (preserving "Zoom" scale better than replacing with High Freqs).
     
     full_freqs = rope_params(max_seq_len, head_dim)  # [max_seq_len, c]
     
-    # Time: Correct
+    # Clamp lowest frequencies to prevent Underflow/Green Grass
+    full_freqs = torch.clamp(full_freqs, min=1e-4)
+
+    # Split using original Full-Dim logic
     freqs_t = full_freqs[:, :c_t]
-    
-    # Height: Correct
     freqs_h = full_freqs[:, c_t:c_t+c_h]
-    
-    # Width: Reuse Height Frequencies (Safe Low Band)
-    # Note: c_w usually equals c_h (21/21 in dim 64, 42/42 in dim 128)
-    # If dimensions differ, we slice from the start of the height band to match c_w length
-    freqs_w = full_freqs[:, c_t:c_t+c_w]
+    freqs_w = full_freqs[:, c_t+c_h:]  # Now safe thanks to clamp
     
     # Convert complex exp(i*angle) -> (cos, sin) pairs
     cos_t = freqs_t.real.float()
