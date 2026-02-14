@@ -280,7 +280,19 @@ class TRTWanDiffusionWrapper(nn.Module):
             # === END DIAGNOSTIC ===
             
             result = self.engine.infer(single_inputs)
-            batch_flow_preds.append(result['output'])
+            _flow = result['output']
+            batch_flow_preds.append(_flow)
+            
+            # === OUTPUT TRACKING (remove after debugging) ===
+            if self._diag_call_count <= 40:
+                _out_norm = _flow.float().norm().item()
+                _out_std = _flow.float().std().item()
+                _out_min = _flow.min().item()
+                _out_max = _flow.max().item()
+                print(f"[TRT_OUT] call={self._diag_call_count} b={b} frame={_frame_idx} "
+                      f"norm={_out_norm:.1f} std={_out_std:.4f} "
+                      f"range=[{_out_min:.3f}, {_out_max:.3f}]")
+            # === END OUTPUT TRACKING ===
             
             # Write trimmed KV output back to full-size pipeline cache
             out_k = result['out_kv_k']  # [1, L, max_valid, N, D]
