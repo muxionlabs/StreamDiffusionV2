@@ -48,11 +48,14 @@ def precompute_rope_freqs_real(max_seq_len: int, head_dim: int, theta: float = 1
     c_h = c // 3             # height freq dims  (21 for head_dim=128)
     c_w = c // 3             # width freq dims   (21 for head_dim=128)
     
-    # Single rope_params call → split by axis (matches original model)
-    full_freqs = rope_params(max_seq_len, head_dim)  # [max_seq_len, c] complex
-    freqs_t = full_freqs[:, :c_t]                     # [max_seq_len, c_t]
-    freqs_h = full_freqs[:, c_t:c_t+c_h]             # [max_seq_len, c_h]
-    freqs_w = full_freqs[:, c_t+c_h:]                 # [max_seq_len, c_w]
+    # Per-Axis Spatial (Restores Structure)
+    # Temporal: use global params (stable)
+    freqs_t = rope_params(max_seq_len, head_dim)[:, :c_t]  # [max_seq_len, c_t]
+    
+    # Spatial: use separate params for H/W to concentrate freqs in lower bands
+    # preventing high-freq aliasing/truncation in FP16/TRT
+    freqs_h = rope_params(max_seq_len, 2 * c_h)  # [max_seq_len, c_h]
+    freqs_w = rope_params(max_seq_len, 2 * c_w)  # [max_seq_len, c_w]
     
     # Convert complex exp(i*angle) -> (cos, sin) pairs
     cos_t = freqs_t.real.float()  # [max_seq_len, c_t]
