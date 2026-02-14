@@ -169,13 +169,59 @@ class SingleGPUInferencePipeline:
         else:
             state_dict = ckpt
 
+        # Special handling for TRTWanDiffusionWrapper
+        # 1. Strip "model." prefix if present (checkpoint usually has it, wrapper properties don't)
+        # 2. Manually load cross-attn modules (kept in a list list of dicts, not visible to load_state_dict)
+        generator = self.pipeline.generator
+        is_trt = type(generator).__name__ == 'TRTWanDiffusionWrapper'
+        
+        if is_trt:
+             # Check if we need to strip "model." prefix
+             first_key = next(iter(state_dict.keys()))
+             if first_key.startswith("model."):
+                 self.logger.info("Stripping 'model.' prefix from checkpoint keys for TRT generator compatibility")
+                 new_state_dict = {}
+                 for k, v in state_dict.items():
+                     if k.startswith("model."):
+                         new_state_dict[k[6:]] = v
+                     else:
+                         new_state_dict[k] = v
+                 state_dict = new_state_dict
+
         # Load into the pipeline generator
+        # For TRTV wrapper, strict=True will always fail because 'blocks' are missing from wrapper
+        strict_load = not is_trt
+        
         try:
-            self.pipeline.generator.load_state_dict(state_dict, strict=True)
+            generator.load_state_dict(state_dict, strict=strict_load)
         except RuntimeError as e:
-            # Try non-strict load as a fallback and report
-            self.logger.warning(f"Strict load_state_dict failed: {e}; retrying with strict=False")
-            self.pipeline.generator.load_state_dict(state_dict, strict=False)
+            if strict_load:
+                self.logger.warning(f"Strict load_state_dict failed: {e}; retrying with strict=False")
+                generator.load_state_dict(state_dict, strict=False)
+            else:
+                self.logger.warning(f"Non-strict load_state_dict report (expected for TRT): {e}")
+
+        if is_trt and hasattr(generator, 'crossattn_modules'):
+             self.logger.info("Manually loading cross-attention modules for TRT wrapper")
+             count_loaded = 0
+             # generator.crossattn_modules is a list of dicts: [{'k': mod, 'v': mod, 'norm_k': mod}, ...]
+             for i, mod_dict in enumerate(generator.crossattn_modules):
+                 # We need to find keys like "blocks.0.cross_attn.k.weight" in state_dict
+                 # (assumes "model." prefix was stripped above)
+                 for subname in ['k', 'v', 'norm_k']: # keys in mod_dict
+                     module = mod_dict[subname]
+                     # Map subname to checkpoint key name segment
+                     # 'k' -> 'k', 'v' -> 'v', 'norm_k' -> 'norm_k' matches standard Wan
+                     for param_name in ['weight', 'bias']:
+                         if hasattr(module, param_name):
+                             # Construct the key expected in state_dict
+                             key = f"blocks.{i}.cross_attn.{subname}.{param_name}"
+                             if key in state_dict:
+                                 module_param = getattr(module, param_name)
+                                 with torch.no_grad():
+                                     module_param.data.copy_(state_dict[key])
+                                 count_loaded += 1
+             self.logger.info(f"Loaded {count_loaded} cross-attention parameters manually")
     
     def prepare_pipeline(self, text_prompts: list, noise: torch.Tensor, 
                         current_start: int, current_end: int):
