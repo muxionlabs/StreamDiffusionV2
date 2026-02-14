@@ -30,6 +30,18 @@ from causvid.models.wan.wan_base.modules.model import (
 # TRT-Safe RoPE Implementation
 # =============================================================================
 
+def precompute_rope_freqs_real(max_seq_len: int, head_dim: int, theta: float = 10000.0):
+    """
+    Precompute RoPE frequencies in sin/cos real format (no complex numbers).
+    Returns cos and sin tensors for temporal, height, and width axes.
+    """
+    d = head_dim
+    c = d // 2  # half head dim for complex pairs
+    
+    c_t = c - 2 * (c // 3)  # temporal freq dims (22 for head_dim=128)
+    c_h = c // 3             # height freq dims  (21 for head_dim=128)
+    c_w = c // 3             # width freq dims   (21 for head_dim=128)
+
     # REVERT TO PER-AXIS SPATIAL (Baseline - Stuck Dog)
     # This configuration is numerically stable and produces a visible subject.
     # We revert to this first to ensure the "Green Grass" is gone.
