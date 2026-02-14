@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+ #!/usr/bin/env python3
 """
 Compare PyTorch CausalWanModel vs TRTCausalWanModel at the model level.
 
@@ -53,7 +53,7 @@ max_cache = frame_seq_len * 10
 x_raw = torch.randn(B, 16, 1, H_lat, W_lat, device='cuda', dtype=torch.bfloat16)
 t_val = 500
 timestep_BF = torch.tensor([[t_val]], device='cuda', dtype=torch.int64)  # [B, F]
-t_flat = torch.tensor([t_val], device='cuda', dtype=torch.int64)          # [B*F]
+t_orig = torch.tensor([[t_val]], device='cuda', dtype=torch.int64)        # [B, F] — original model uses t.shape for unflatten
 
 # Text context
 raw_context = torch.randn(B, 512, 4096, device='cuda', dtype=torch.bfloat16)
@@ -99,7 +99,7 @@ ctx_list = [raw_context[0]]     # list of [512, 4096] — single batch item
 
 with torch.no_grad():
     orig_output = original_model(
-        x_list, t_flat, ctx_list,
+        x_list, t_orig, ctx_list,
         seq_len=max_cache,
         kv_cache=orig_kv,
         crossattn_cache=orig_ca,
@@ -200,14 +200,14 @@ torch.manual_seed(123)
 x1_raw = torch.randn(B, 16, 1, H_lat, W_lat, device='cuda', dtype=torch.bfloat16)
 t1_val = 547
 ts1_BF = torch.tensor([[t1_val]], device='cuda', dtype=torch.int64)
-t1_flat = torch.tensor([t1_val], device='cuda', dtype=torch.int64)
+t1_orig = torch.tensor([[t1_val]], device='cuda', dtype=torch.int64)
 cs1 = torch.tensor([frame_seq_len], device='cuda', dtype=torch.long)
 ce1 = torch.tensor([frame_seq_len * 2], device='cuda', dtype=torch.long)
 
 # Original model frame 1
 with torch.no_grad():
     orig_out1 = original_model(
-        [x1_raw[0]], t1_flat, ctx_list,
+        [x1_raw[0]], t1_orig, ctx_list,
         seq_len=max_cache,
         kv_cache=orig_kv, crossattn_cache=orig_ca,
         current_start=cs1, current_end=ce1,
