@@ -335,19 +335,10 @@ class TRTWanDiffusionWrapper(nn.Module):
         head_dim = self.head_dim
         max_seq_len = 1024 # Sufficient for frequencies
         
-        full_freqs = rope_params(max_seq_len, head_dim).to(device)
-        
-        half_dim = head_dim // 2
-        c_t = half_dim - 2 * (half_dim // 3)
-        c_h = half_dim // 3
-        c_w = half_dim // 3
-        
-        # --- CONFIGURABLE FREQUENCY LOGIC ---
         # 4. TRUE BASELINE (Original Wan Implementation)
         #    - Generate frequencies for the full head_dim.
         #    - Split into [c_t, c_h, c_w].
         #    - T=High (Start), H=Med (Middle), W=Low (End).
-        #    - This ensures we match the trained frequency bands.
         
         full_freqs = rope_params(max_seq_len, self.head_dim).to(device) # [Seq, 64] complex
         
