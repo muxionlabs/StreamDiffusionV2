@@ -335,6 +335,11 @@ class TRTWanDiffusionWrapper(nn.Module):
         head_dim = self.head_dim
         max_seq_len = 1024 # Sufficient for frequencies
         
+        half_dim = head_dim // 2
+        c_t = half_dim - 2 * (half_dim // 3)
+        c_h = half_dim // 3
+        c_w = half_dim // 3
+        
         # 4. TRUE BASELINE (Original Wan Implementation)
         #    - Generate frequencies for the full head_dim.
         #    - Split into [c_t, c_h, c_w].
