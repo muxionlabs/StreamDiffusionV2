@@ -79,13 +79,17 @@ def create_dummy_inputs(
     # Create dummy float32 RoPE inputs (length 1024 to suffice)
     rope_len = 1024
     half_dim = head_dim // 2
+    c_t = half_dim - 2 * (half_dim // 3)
+    c_h = half_dim // 3
+    c_w = half_dim // 3
+    
     rope_inputs = {
-        'rope_cos_t': torch.randn(rope_len, half_dim, device=device, dtype=torch.float32),
-        'rope_sin_t': torch.randn(rope_len, half_dim, device=device, dtype=torch.float32),
-        'rope_cos_h': torch.randn(rope_len, half_dim, device=device, dtype=torch.float32),
-        'rope_sin_h': torch.randn(rope_len, half_dim, device=device, dtype=torch.float32),
-        'rope_cos_w': torch.randn(rope_len, half_dim, device=device, dtype=torch.float32),
-        'rope_sin_w': torch.randn(rope_len, half_dim, device=device, dtype=torch.float32),
+        'rope_cos_t': torch.randn(rope_len, c_t, device=device, dtype=torch.float32),
+        'rope_sin_t': torch.randn(rope_len, c_t, device=device, dtype=torch.float32),
+        'rope_cos_h': torch.randn(rope_len, c_h, device=device, dtype=torch.float32),
+        'rope_sin_h': torch.randn(rope_len, c_h, device=device, dtype=torch.float32),
+        'rope_cos_w': torch.randn(rope_len, c_w, device=device, dtype=torch.float32),
+        'rope_sin_w': torch.randn(rope_len, c_w, device=device, dtype=torch.float32),
     }
 
     inputs = {
