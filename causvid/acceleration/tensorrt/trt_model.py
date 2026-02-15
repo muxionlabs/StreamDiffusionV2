@@ -713,10 +713,18 @@ class TRTCausalWanModel(nn.Module):
         # 3. Text embedding (applies the MLP)
         context = self.text_embedding(context)  # [B, text_len, dim]
         
-        # 4. current_start is the FRAME INDEX (computed in trt_wrapper.py)
-        # No division needed here — trt_wrapper converts token index to frame index
-        # before passing to the engine.
-        start_frame_idx = current_start[0]
+        # 4. Correct Frame Index Calculation
+        # The input 'current_start' is a TOKEN index (e.g., 1560 for frame 1).
+        # But RoPE requires a FRAME index (e.g., 1) to generate correct temporal embeddings.
+        # Passing 1560 causes massive phase aliasing and breaks temporal continuity.
+        # We must divide by the spatial size (H*W) to recover the frame index.
+        H_p, W_p = x.shape[3], x.shape[4]
+        tokens_per_frame = H_p * W_p
+        start_frame_idx = current_start[0] // tokens_per_frame
+        
+        # Guard against zero division (though H*W shouldn't be 0)
+        if tokens_per_frame == 0:
+            start_frame_idx = current_start[0] # Fallback
         
         # 5. Run transformer blocks
         for i, block in enumerate(self.blocks):
