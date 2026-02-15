@@ -347,7 +347,47 @@ class TRTWanDiffusionWrapper(nn.Module):
         }
         
         self._rope_cache = {'key': cache_key, 'tensors': rope_inputs}
-        return rope_inputs        
+        return rope_inputs
+
+    def _update_pipeline_cache(self, kv_cache, out_k, out_v, local_end_indices, B, b_idx):
+        """
+        Update the pipeline's KV cache with results from the TRT engine.
+        
+        Args:
+            kv_cache: List[dict] - The pipeline's cache structure
+            out_k: [1, L, max_valid, N, D] - Updated Keys from engine
+            out_v: [1, L, max_valid, N, D] - Updated Values from engine
+            local_end_indices: [L] - Valid length for each layer
+            B: int - Total batch size (unused but kept for signature consistency)
+            b_idx: int - Index of current batch item being processed
+        """
+        for i, cache_entry in enumerate(kv_cache):
+            # Engine output for this layer: [1, max_valid, N, D] -> [max_valid, N, D]
+            layer_out_k = out_k[0, i]
+            layer_out_v = out_v[0, i]
+            
+            # Valid length for this layer
+            valid_len = int(local_end_indices[i].item())
+            
+            # Update cache: copy valid portion to the pipeline cache
+            # cache_entry['k'] is [B, max_cache_len, N, D]
+            # storage is pre-allocated.
+            
+            # Safety check
+            if valid_len > layer_out_k.shape[0]:
+                 # This should not happen if engine ran correctly, 
+                 # but if valid_len > max_valid, we clamp
+                 valid_len = layer_out_k.shape[0]
+
+            cache_entry['k'][b_idx, :valid_len] = layer_out_k[:valid_len].to(
+                cache_entry['k'].dtype)
+            cache_entry['v'][b_idx, :valid_len] = layer_out_v[:valid_len].to(
+                cache_entry['v'].dtype)
+                
+            # Update metadata
+            cache_entry['local_end_index'][b_idx] = local_end_indices[i]
+            # global_end_index is updated by pipeline logic, but we can sync if needed.
+            # Here we just ensure the data is correct.        
         # Combine flow predictions from all batch items
         flow_pred_combined = torch.cat(batch_flow_preds, dim=0)
         
