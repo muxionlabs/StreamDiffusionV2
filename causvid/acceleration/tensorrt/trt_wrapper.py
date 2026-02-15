@@ -343,23 +343,17 @@ class TRTWanDiffusionWrapper(nn.Module):
         c_w = half_dim // 3
         
         # --- CONFIGURABLE FREQUENCY LOGIC ---
-        # 3. Linear Shift / Context Extension Strategy
-        #    - Problem: High Freqs (~1.0) cause "Static" aliasing.
-        #    - Problem: Low Freqs (Factor 100) cause "Grass" underflow.
-        #    - Idea: Smoothly stretch the frequencies to cover the time domain.
-        #    - "Linear Scaling": freq_new = freq_old / scale_factor.
-        #    - scale_factor = (target_seq_len / original_training_seq_len).
-        #    - Wan Video trained on short clips? extending to longer?
-        #    - Let's try a Factor that is related to Frame Count.
-        #    - If we want to support ~81 frames, maybe Factor 4.0 is safer than 30?
-        #    - Let's try Factor 4.0 (Linear Scale).
+        # 4. TRUE BASELINE (Original Wan Implementation)
+        #    - Generate frequencies for the full head_dim.
+        #    - Split into [c_t, c_h, c_w].
+        #    - T=High (Start), H=Med (Middle), W=Low (End).
+        #    - This ensures we match the trained frequency bands.
         
-        scale_factor = 4.0 
-        freqs_t = full_freqs[:, :c_t] / scale_factor
+        full_freqs = rope_params(max_seq_len, self.head_dim).to(device) # [Seq, 64] complex
         
-        # 2. Space: Standard High Freqs (Stable - Stuck Dog Baseline)
-        freqs_h = rope_params(max_seq_len, 2 * c_h).to(device)
-        freqs_w = rope_params(max_seq_len, 2 * c_w).to(device)
+        freqs_t = full_freqs[:, :c_t]
+        freqs_h = full_freqs[:, c_t : c_t + c_h]
+        freqs_w = full_freqs[:, c_t + c_h :]
         # ------------------------------------
 
         rope_inputs = {
