@@ -345,11 +345,19 @@ class TRTWanDiffusionWrapper(nn.Module):
         #    - Split into [c_t, c_h, c_w].
         #    - T=High (Start), H=Med (Middle), W=Low (End).
         
+        # 5. STABILITY TEST: AVOID LOWEST FREQUENCIES
+        #    - True Baseline (Low Freqs for Width) -> Green Grass (Instability).
+        #    - Stuck Dog (High Freqs everywhere) -> Stable (but Static).
+        #    - Hypothesis: Lowest band (Indices 43-64) causes FP16 issues in TRT.
+        #    - Experiment: Use Height (Mid) Frequencies for Width too.
+        #    - [High, Med, Med] instead of [High, Med, Low].
+        
         full_freqs = rope_params(max_seq_len, self.head_dim).to(device) # [Seq, 64] complex
         
-        freqs_t = full_freqs[:, :c_t]
-        freqs_h = full_freqs[:, c_t : c_t + c_h]
-        freqs_w = full_freqs[:, c_t + c_h :]
+        freqs_t = full_freqs[:, :c_t]           # High (0-22) - Keep Original
+        freqs_h = full_freqs[:, c_t : c_t + c_h] # Med  (22-43) - Keep Original
+        freqs_w = freqs_h.clone()               # Med  (22-43) - ALIAS WIDTH TO MED
+        # ------------------------------------
         # ------------------------------------
 
         rope_inputs = {
