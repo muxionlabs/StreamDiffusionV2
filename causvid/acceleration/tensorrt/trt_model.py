@@ -715,11 +715,12 @@ class TRTCausalWanModel(nn.Module):
         
         # 4. Correct Frame Index Calculation
         # The input 'current_start' is a TOKEN index (e.g., 1560 for frame 1).
-        # But RoPE requires a FRAME index (e.g., 1) to generate correct temporal embeddings.
-        # Passing 1560 causes massive phase aliasing and breaks temporal continuity.
         # We must divide by the spatial size (H*W) to recover the frame index.
-        H_p, W_p = x.shape[3], x.shape[4]
+        # Note: x is already flattened here, so we use grid_sizes which stores [F, H, W]
+        H_p = grid_sizes[0, 1]
+        W_p = grid_sizes[0, 2]
         tokens_per_frame = H_p * W_p
+        
         start_frame_idx = current_start[0] // tokens_per_frame
         
         # Guard against zero division (though H*W shouldn't be 0)
