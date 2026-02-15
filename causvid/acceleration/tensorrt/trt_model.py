@@ -49,23 +49,21 @@ def precompute_rope_freqs_real(max_seq_len: int, head_dim: int, theta: float = 1
     #    - Mapped Low (100.0x equivalent) = Green Grass (Crash).
     #    - We try 2.0x to encourage motion while staying SAFELY in the high-freq band.
     #    - Effective Range: ~0.5 to ~0.025. (Min Safe is ~0.0001).
-    # Time Shift Approach:
-    # 1. Spatial: Keep Per-Axis (Stuck Dog). Indices 0..c_h/w.
-    #    - We KNOW any scaling/mapping of Width causes Green Grass.
-    #    - So we MUST accept High Freqs for Space.
-    # 2. Time: Shift to Height Band (Indices c_t..c_t+c_t).
-    #    - Currently, Time (0..22) and Space (0..21) use the SAME frequencies.
-    #    - This collision likely makes Time look like Space -> Static Image.
-    #    - We shift Time to the next band (22..44) to differentiate it.
+    # Time Shift Reverted (Standard Band):
+    # 1. Coordinate Fix is Active (t = 0, 1, 2...).
+    # 2. We previously shifted Time to Medium Band (22..44) to avoid collision.
+    # 3. But the result was "Completely Static".
+    # 4. We suspect Medium Band is too slow. We generally need High Freqs for sharp attention.
+    # 5. We revert Time to High Freqs (0..22) to match Space, hoping Correct Coordinates fixes the collision/wiggle.
     
     # Generate standard full frequencies
     full_freqs = rope_params(max_seq_len, head_dim)
 
-    # Time: SHIFTED to indices [c_t : 2*c_t]
-    # (Approx indices 22 to 44)
-    freqs_t = full_freqs[:, c_t : 2*c_t]
+    # Time: Standard High-Frequency Band (0..c_t)
+    # Same as PyTorch default.
+    freqs_t = full_freqs[:, :c_t]
     
-    # Spatial: Per-Axis Baseline (Stuck Dog)
+    # Spatial: Per-Axis Baseline (Stuck Dog - High Freq)
     freqs_h = rope_params(max_seq_len, 2 * c_h)
     freqs_w = rope_params(max_seq_len, 2 * c_w)
     
