@@ -303,7 +303,21 @@ class TRTWanDiffusionWrapper(nn.Module):
             if kv_cache is not None:
                 self._update_pipeline_cache(kv_cache, out_k, out_v, new_local_end[b], B, b)
         
-        return torch.cat(batch_flow_preds, dim=0)
+        # Combine flow predictions from all batch items
+        flow_pred_combined = torch.cat(batch_flow_preds, dim=0)
+        
+        # Extract flow prediction and permute back: [B, C, F, H, W] -> [B, F, C, H, W]
+        flow_pred = flow_pred_combined.permute(0, 2, 1, 3, 4).to(
+            noisy_image_or_video.dtype)
+        
+        # Convert flow prediction to x0 (stays in PyTorch)
+        pred_x0 = self._convert_flow_pred_to_x0(
+            flow_pred=flow_pred.flatten(0, 1),
+            xt=noisy_image_or_video.flatten(0, 1),
+            timestep=timestep.flatten(0, 1)
+        ).unflatten(0, flow_pred.shape[:2])
+        
+        return pred_x0
 
     def _get_rope_inputs(self, dtype, device):
         """
@@ -384,25 +398,8 @@ class TRTWanDiffusionWrapper(nn.Module):
             cache_entry['v'][b_idx, :valid_len] = layer_out_v[:valid_len].to(
                 cache_entry['v'].dtype)
                 
-            # Update metadata
-            cache_entry['local_end_index'][b_idx] = local_end_indices[i]
             # global_end_index is updated by pipeline logic, but we can sync if needed.
-            # Here we just ensure the data is correct.        
-        # Combine flow predictions from all batch items
-        flow_pred_combined = torch.cat(batch_flow_preds, dim=0)
-        
-        # Extract flow prediction and permute back: [B, C, F, H, W] -> [B, F, C, H, W]
-        flow_pred = flow_pred_combined.permute(0, 2, 1, 3, 4).to(
-            noisy_image_or_video.dtype)
-        
-        # Convert flow prediction to x0 (stays in PyTorch)
-        pred_x0 = self._convert_flow_pred_to_x0(
-            flow_pred=flow_pred.flatten(0, 1),
-            xt=noisy_image_or_video.flatten(0, 1),
-            timestep=timestep.flatten(0, 1)
-        ).unflatten(0, flow_pred.shape[:2])
-        
-        return pred_x0
+            # Here we just ensure the data is correct.
     
     # =========================================================================
     # KV Cache Conversion: Pipeline dict format <-> TRT flat tensor format
