@@ -76,6 +76,18 @@ def create_dummy_inputs(
     W_p = W_latent // 2  # 52
     frame_seq_len = H_p * W_p  # 1560
     
+    # Create dummy float32 RoPE inputs (length 1024 to suffice)
+    rope_len = 1024
+    half_dim = head_dim // 2
+    rope_inputs = {
+        'rope_cos_t': torch.randn(rope_len, half_dim, device=device, dtype=torch.float32),
+        'rope_sin_t': torch.randn(rope_len, half_dim, device=device, dtype=torch.float32),
+        'rope_cos_h': torch.randn(rope_len, half_dim, device=device, dtype=torch.float32),
+        'rope_sin_h': torch.randn(rope_len, half_dim, device=device, dtype=torch.float32),
+        'rope_cos_w': torch.randn(rope_len, half_dim, device=device, dtype=torch.float32),
+        'rope_sin_w': torch.randn(rope_len, half_dim, device=device, dtype=torch.float32),
+    }
+
     inputs = {
         'x': torch.randn(batch_size, 16, num_frames, H_latent, W_latent,
                          device=device, dtype=dtype),
@@ -99,6 +111,7 @@ def create_dummy_inputs(
                                        num_heads, head_dim, device=device, dtype=dtype),
         'all_crossattn_v': torch.randn(batch_size, num_layers, text_len,
                                        num_heads, head_dim, device=device, dtype=dtype),
+        **rope_inputs # Add RoPE inputs
     }
     
     return inputs
@@ -160,7 +173,15 @@ def export_to_onnx(
     )
     
     # Input/output names for ONNX
-    input_names = list(inputs.keys())
+    # Ensure simplified input names (remove kwargs names if any)
+    # Using list(inputs.keys()) works but ensuring order is key.
+    input_names = [
+        'x', 'timestep', 'context', 'current_start', 'current_end',
+        'all_kv_k', 'all_kv_v', 'all_kv_seq_lens', 'all_local_start_indices',
+        'all_crossattn_k', 'all_crossattn_v',
+        'rope_cos_t', 'rope_sin_t', 'rope_cos_h', 'rope_sin_h', 'rope_cos_w', 'rope_sin_w'
+    ]
+    
     output_names = [
         'output',
         'out_kv_k',
@@ -189,6 +210,15 @@ def export_to_onnx(
         'all_local_start_indices': {0: 'batch'},
         'all_crossattn_k': {0: 'batch'},
         'all_crossattn_v': {0: 'batch'},
+        # RoPE inputs are fixed size (usually 1024 or MAX_SEQ_LEN).
+        # We can make distinct axes dynamic if we want to change max length.
+        'rope_cos_t': {0: 'freq_len'},
+        'rope_sin_t': {0: 'freq_len'},
+        'rope_cos_h': {0: 'freq_len'},
+        'rope_sin_h': {0: 'freq_len'},
+        'rope_cos_w': {0: 'freq_len'},
+        'rope_sin_w': {0: 'freq_len'},
+        
         # Outputs
         'output': {0: 'batch', 2: 'out_frames'},
         'out_kv_k': {0: 'batch', 2: 'cache_len'},
@@ -392,27 +422,8 @@ def main():
     ckpt_path = os.path.join(args.checkpoint_folder, "model.pt")
     load_checkpoint_for_trt(ckpt_path, model, strict=False)
     
-    # CRITICAL: Keep RoPE buffers in float32 even when model is FP16.
-    # Full-dim spatial bands 22-42 have very small sin values (~0.001-0.007).
-    # In FP16, these get truncated, making all spatial positions indistinguishable
-    # → attention collapses → "green grass" artifact.
-    # Must be done AFTER load_checkpoint_for_trt to avoid being overwritten.
-    if args.fp16:
-        rope_buf_names = ['rope_cos_t', 'rope_sin_t', 'rope_cos_h', 'rope_sin_h',
-                          'rope_cos_w', 'rope_sin_w']
-        # Recompute from scratch in float32 (the buffers from __init__ may have been
-        # converted to fp16 by model.to())
-        from causvid.acceleration.tensorrt.trt_model import precompute_rope_freqs_real
-        rope_freqs = precompute_rope_freqs_real(1024, model.head_dim)
-        for name, buf in zip(rope_buf_names, rope_freqs):
-            # register_buffer replaces existing buffer
-            model.register_buffer(name, buf.to(model.rope_cos_t.device))
-        
-        # Verify
-        for name in rope_buf_names:
-            buf = getattr(model, name)
-            print(f"  [VERIFY] {name}: dtype={buf.dtype}, device={buf.device}")
-        print(f"  [VERIFY] RoPE buffers are float32: {model.rope_cos_t.dtype == torch.float32}")
+    # Note: RoPE buffers are now passed as inputs, so we don't need to manually
+    # verify/cast them here. They are not part of the model state dict.
     
     # Export
     export_to_onnx(

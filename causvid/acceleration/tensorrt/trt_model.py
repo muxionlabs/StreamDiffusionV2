@@ -49,19 +49,22 @@ def precompute_rope_freqs_real(max_seq_len: int, head_dim: int, theta: float = 1
     #    - Mapped Low (100.0x equivalent) = Green Grass (Crash).
     #    - We try 2.0x to encourage motion while staying SAFELY in the high-freq band.
     #    - Effective Range: ~0.5 to ~0.025. (Min Safe is ~0.0001).
-    # Time Shift Reverted (Standard Band):
+    # Scaled Time Approach (Simulate Low Freqs):
     # 1. Coordinate Fix is Active (t = 0, 1, 2...).
-    # 2. We previously shifted Time to Medium Band (22..44) to avoid collision.
-    # 3. But the result was "Completely Static".
-    # 4. We suspect Medium Band is too slow. We generally need High Freqs for sharp attention.
-    # 5. We revert Time to High Freqs (0..22) to match Space, hoping Correct Coordinates fixes the collision/wiggle.
+    # 2. Standard High Freqs (Freq ~ 1.0) cause "Static" output.
+    #    - Reason: "Fast Spinning". t changes by integer steps. Phase changes by ~1.0 radian per frame.
+    #    - This looks like random noise/aliasing to the model?
+    # 3. We need "Slow Features" (Low Freqs) for global motion.
+    # 4. We CANNOT use actual Low Freqs (Underflow/Grass).
+    # 5. Solution: Divide High Freqs by a factor (e.g., 30.0).
+    #    - Effectively "slows down time" or "shifts to longer wavelengths".
+    #    - Freq 1.0 -> 0.033. Phase changes by 0.033 rad/frame (smooth motion).
     
     # Generate standard full frequencies
     full_freqs = rope_params(max_seq_len, head_dim)
 
-    # Time: Standard High-Frequency Band (0..c_t)
-    # Same as PyTorch default.
-    freqs_t = full_freqs[:, :c_t]
+    # Time: High-Frequency Band SCALED by 30.0
+    freqs_t = full_freqs[:, :c_t] / 30.0
     
     # Spatial: Per-Axis Baseline (Stuck Dog - High Freq)
     freqs_h = rope_params(max_seq_len, 2 * c_h)
@@ -641,13 +644,11 @@ class TRTCausalWanModel(nn.Module):
         self.head = TRTCausalHead(dim, out_dim, patch_size, eps)
         
         # Precomputed RoPE frequencies (real-valued)
-        rope_freqs = precompute_rope_freqs_real(1024, self.head_dim)
-        self.register_buffer('rope_cos_t', rope_freqs[0])
-        self.register_buffer('rope_sin_t', rope_freqs[1])
-        self.register_buffer('rope_cos_h', rope_freqs[2])
-        self.register_buffer('rope_sin_h', rope_freqs[3])
-        self.register_buffer('rope_cos_w', rope_freqs[4])
-        self.register_buffer('rope_sin_w', rope_freqs[5])
+        # REMOVED: buffers are now passed as inputs to forward()
+        # so we can change frequencies at runtime without rebuilding engine.
+        # rope_freqs = precompute_rope_freqs_real(1024, self.head_dim)
+        # self.register_buffer('rope_cos_t', rope_freqs[0])
+        # ...
     
     def forward(
         self,
@@ -664,6 +665,13 @@ class TRTCausalWanModel(nn.Module):
         # Flattened cross-attn cache: [B, num_layers, ctx_len, num_heads, head_dim]
         all_crossattn_k: torch.Tensor,
         all_crossattn_v: torch.Tensor,
+        # Dynamic RoPE inputs
+        rope_cos_t: torch.Tensor,
+        rope_sin_t: torch.Tensor,
+        rope_cos_h: torch.Tensor,
+        rope_sin_h: torch.Tensor,
+        rope_cos_w: torch.Tensor,
+        rope_sin_w: torch.Tensor,
     ):
         """
         TRT-exportable forward pass.
@@ -681,6 +689,7 @@ class TRTCausalWanModel(nn.Module):
             all_local_start_indices: [B, num_layers] — write positions per layer
             all_crossattn_k: [B, num_layers, ctx_len, num_heads, head_dim]
             all_crossattn_v: [B, num_layers, ctx_len, num_heads, head_dim]
+            rope_cos/sin_*: [freq_len, half_dim] precomputed RoPE frequencies
             
         Returns:
             output: [B, C_out, F_out, H_out, W_out] — predicted flow
@@ -737,9 +746,9 @@ class TRTCausalWanModel(nn.Module):
             
             x, updated_k, updated_v, updated_seq = block(
                 x, e0, grid_sizes,
-                self.rope_cos_t, self.rope_sin_t,
-                self.rope_cos_h, self.rope_sin_h,
-                self.rope_cos_w, self.rope_sin_w,
+                rope_cos_t, rope_sin_t,
+                rope_cos_h, rope_sin_h,
+                rope_cos_w, rope_sin_w,
                 layer_kv_k, layer_kv_v, layer_seq_len, layer_start,
                 layer_cross_k, layer_cross_v,
                 start_frame=start_frame_idx,

@@ -248,13 +248,15 @@ class TRTWanDiffusionWrapper(nn.Module):
             max_valid = int(new_local_end[b].max().item())
             max_valid = max(max_valid, min_cache)  # respect engine minimum
             
+            # Prepare RoPE inputs (Runtime configurable!)
+            # We can now change frequencies per-forward call if needed.
+            # Defaulting to Factor 30.0 (Time) for smooth motion.
+            rope_inputs = self._get_rope_inputs(engine_dtype, self.device)
+
             single_inputs = {
                 'x': x[b:b+1].to(engine_dtype),
                 'timestep': input_timestep[b:b+1].to(torch.int64),
                 # Convert token index to frame index for RoPE offset.
-                # current_start is token offset (0, 1560, 3120...).
-                # The engine's trt_model treats current_start as frame index.
-                # Original CausalWanModel: current_start_frame = current_start // frame_seqlen
                 'current_start': (current_start[b:b+1] // frame_seq_len).to(torch.int64),
                 'all_kv_k': all_kv_k[b:b+1, :, :max_valid].to(engine_dtype),
                 'all_kv_v': all_kv_v[b:b+1, :, :max_valid].to(engine_dtype),
@@ -262,6 +264,7 @@ class TRTWanDiffusionWrapper(nn.Module):
                 'all_local_start_indices': correct_local_start[b:b+1].to(torch.int64),
                 'all_crossattn_k': all_cross_k[b:b+1].to(engine_dtype),
                 'all_crossattn_v': all_cross_v[b:b+1].to(engine_dtype),
+                **rope_inputs
             }
             
             # === DIAGNOSTIC LOGGING (remove after debugging) ===
@@ -298,14 +301,53 @@ class TRTWanDiffusionWrapper(nn.Module):
             out_k = result['out_kv_k']  # [1, L, max_valid, N, D]
             out_v = result['out_kv_v']
             if kv_cache is not None:
-                for i, cache_entry in enumerate(kv_cache):
-                    cache_entry['k'][b, :max_valid] = out_k[0, i, :max_valid].to(
-                        cache_entry['k'].dtype)
-                    cache_entry['v'][b, :max_valid] = out_v[0, i, :max_valid].to(
-                        cache_entry['v'].dtype)
-                    cache_entry['local_end_index'][b] = new_local_end[b, i]
-                    cache_entry['global_end_index'][b] = current_end[b]
+                self._update_pipeline_cache(kv_cache, out_k, out_v, new_local_end[b], B, b)
         
+        return torch.cat(batch_flow_preds, dim=0)
+
+    def _get_rope_inputs(self, dtype, device):
+        """
+        Generate RoPE frequency tensors. 
+        Refactored to be generated at runtime.
+        """
+        # Cache key based on dtype/device
+        cache_key = (dtype, device)
+        if hasattr(self, '_rope_cache') and self._rope_cache.get('key') == cache_key:
+             return self._rope_cache['tensors']
+
+        # Import RoPE logic (reuse logic from trt_model)
+        from causvid.acceleration.tensorrt.trt_model import rope_params
+        
+        head_dim = self.head_dim
+        max_seq_len = 1024 # Sufficient for frequencies
+        
+        full_freqs = rope_params(max_seq_len, head_dim).to(device)
+        
+        half_dim = head_dim // 2
+        c_t = half_dim - 2 * (half_dim // 3)
+        c_h = half_dim // 3
+        c_w = half_dim // 3
+        
+        # --- CONFIGURABLE FREQUENCY LOGIC ---
+        # 1. Time: Scale High Freqs by 30.0 (Slow motion)
+        freqs_t = full_freqs[:, :c_t] / 30.0
+        
+        # 2. Space: Standard High Freqs (Stable)
+        freqs_h = rope_params(max_seq_len, 2 * c_h).to(device)
+        freqs_w = rope_params(max_seq_len, 2 * c_w).to(device)
+        # ------------------------------------
+
+        rope_inputs = {
+            'rope_cos_t': freqs_t.real.to(dtype=torch.float32).contiguous(), # Keep float32 for safety
+            'rope_sin_t': freqs_t.imag.to(dtype=torch.float32).contiguous(),
+            'rope_cos_h': freqs_h.real.to(dtype=torch.float32).contiguous(),
+            'rope_sin_h': freqs_h.imag.to(dtype=torch.float32).contiguous(),
+            'rope_cos_w': freqs_w.real.to(dtype=torch.float32).contiguous(),
+            'rope_sin_w': freqs_w.imag.to(dtype=torch.float32).contiguous(),
+        }
+        
+        self._rope_cache = {'key': cache_key, 'tensors': rope_inputs}
+        return rope_inputs        
         # Combine flow predictions from all batch items
         flow_pred_combined = torch.cat(batch_flow_preds, dim=0)
         
