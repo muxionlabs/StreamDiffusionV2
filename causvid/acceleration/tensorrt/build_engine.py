@@ -146,6 +146,30 @@ def build_engine(
         opt=(opt_batch, num_layers, text_len, num_heads, head_dim),
         max=(max_batch, num_layers, text_len, num_heads, head_dim))
     
+    # RoPE inputs: [freq_len, dim]
+    # We used freq_len=1024 in export. 
+    # Shapes must match the split logic:
+    half_dim = head_dim // 2
+    c_t = half_dim - 2 * (half_dim // 3)
+    c_h = half_dim // 3
+    c_w = half_dim // 3
+    
+    rope_len = 1024
+    # We can allow dynamic length or fix it. Let's fix min to 1 and max to 4096 (safe).
+    min_rope = 1
+    opt_rope = 1024
+    max_rope = 4096
+    
+    for name, dim_size in [
+        ('rope_cos_t', c_t), ('rope_sin_t', c_t),
+        ('rope_cos_h', c_h), ('rope_sin_h', c_h),
+        ('rope_cos_w', c_w), ('rope_sin_w', c_w)
+    ]:
+        profile.set_shape(name,
+            min=(min_rope, dim_size),
+            opt=(opt_rope, dim_size),
+            max=(max_rope, dim_size))
+    
     config.add_optimization_profile(profile)
     
     # Build engine
