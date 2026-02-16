@@ -464,7 +464,6 @@ def main():
 
     # Optimized img2img path
     if args.image_path is not None and args.img2img:
-        import os
         import numpy as np
         import imageio
         # --- Fast img2img: skip chunking, cache, and video logic ---
