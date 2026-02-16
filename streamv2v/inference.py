@@ -102,21 +102,22 @@ class SingleGPUInferencePipeline:
     including encoding, inference, and decoding.
     """
     
-    def __init__(self, config, device: torch.device):
+    def __init__(self, config, device: torch.device, debug_dump=None):
         """
         Initialize the single GPU inference pipeline manager.
         
         Args:
             config: Configuration object
-            device: GPU device
+            device: execution device
+            debug_dump: Path to dump debug tensors
         """
         self.config = config
         self.device = device
+        self.debug_dump = debug_dump
         
-        # Setup logging
+        # Configure logging
         self.logger = logging.getLogger("SingleGPUInference")
         self.logger.setLevel(logging.INFO)
-        # Prevent messages from propagating to the root logger (avoid double prints)
         self.logger.propagate = False
         
         if not self.logger.handlers:
@@ -135,10 +136,10 @@ class SingleGPUInferencePipeline:
             )
             self.logger.info(f"Using TRT engine: {engine_path}")
             self.pipeline = TRTCausalStreamInferencePipeline(
-                args, device=str(device), engine_path=engine_path, debug_dump=debug_dump)
+                config, device=str(device), engine_path=engine_path, debug_dump=debug_dump)
             self.pipeline.to(device=str(device), dtype=torch.bfloat16)
         else:
-            self.pipeline = CausalStreamInferencePipeline(args, device=str(device), debug_dump=debug_dump)
+            self.pipeline = CausalStreamInferencePipeline(config, device=str(device), debug_dump=debug_dump)
             self.pipeline.to(device=str(device), dtype=torch.bfloat16)
         
         # Performance tracking
@@ -467,7 +468,7 @@ def main():
         import numpy as np
         import imageio
         # --- Fast img2img: skip chunking, cache, and video logic ---
-        pipeline_manager = SingleGPUInferencePipeline(config, device)
+        pipeline_manager = SingleGPUInferencePipeline(config, device, debug_dump=args.debug_dump)
         pipeline_manager.load_model(args.checkpoint_folder)
         dataset = TextDataset(args.prompt_file_path)
         prompts = [dataset[0]]
@@ -518,7 +519,7 @@ def main():
         # Default: video or img2vid path
         chunck_size = 4
         num_chuncks = (t - 1) // chunck_size
-        pipeline_manager = SingleGPUInferencePipeline(config, device)
+        pipeline_manager = SingleGPUInferencePipeline(config, device, debug_dump=args.debug_dump)
         pipeline_manager.load_model(args.checkpoint_folder)
         dataset = TextDataset(args.prompt_file_path)
         prompts = [dataset[0]]
