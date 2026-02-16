@@ -8,8 +8,9 @@ import torch
 import torch.distributed as dist
 
 class CausalStreamInferencePipeline(torch.nn.Module):
-    def __init__(self, args, device):
+    def __init__(self, args, device, debug_dump=None):
         super().__init__()
+        self.debug_dump = debug_dump
         model_type = args.model_type
         self.device = device
         # Step 1: Initialize all models
@@ -144,6 +145,12 @@ class CausalStreamInferencePipeline(torch.nn.Module):
         current_end = torch.tensor([current_end], dtype=torch.long, device=device)
 
         for index, current_timestep in enumerate(self.denoising_step_list):
+            # Dump Inputs if debug_dump is set
+            if self.debug_dump and index == 0:
+                 import os
+                 os.makedirs(self.debug_dump, exist_ok=True)
+                 torch.save(noise.cpu(), os.path.join(self.debug_dump, "vae_latents_input.pt"))
+
             # set current timestep
             timestep = torch.ones(
                 [batch_size, noise.shape[1]], device=noise.device, dtype=torch.int64) * current_timestep
@@ -158,6 +165,14 @@ class CausalStreamInferencePipeline(torch.nn.Module):
                     current_start=current_start,
                     current_end=current_end
                 )
+                
+                if self.debug_dump:
+                    try:
+                        import os
+                        torch.save(denoised_pred.cpu(), os.path.join(self.debug_dump, f"denoised_step_{index}.pt"))
+                    except Exception as e:
+                        print(f"Failed to dump debug tensor: {e}")
+
                 next_timestep = self.denoising_step_list[index + 1]
                 noise = self.scheduler.add_noise(
                     denoised_pred.flatten(0, 1),
@@ -294,6 +309,14 @@ class CausalStreamInferencePipeline(torch.nn.Module):
                     current_start=current_start,
                     current_end=current_end
                 )
+                
+                if self.debug_dump:
+                    try:
+                        import os
+                        torch.save(denoised_pred.cpu(), os.path.join(self.debug_dump, f"denoised_step_{index}.pt"))
+                    except Exception as e:
+                        print(f"Failed to dump debug tensor: {e}")
+
                 next_timestep = self.denoising_step_list[index + 1]
                 noise = self.scheduler.add_noise(
                     denoised_pred.flatten(0, 1),
@@ -313,6 +336,13 @@ class CausalStreamInferencePipeline(torch.nn.Module):
                     current_start=current_start,
                     current_end=current_end
                 )
+                
+                if self.debug_dump:
+                    try:
+                        import os
+                        torch.save(denoised_pred.cpu(), os.path.join(self.debug_dump, f"denoised_step_{index}.pt"))
+                    except Exception as e:
+                        print(f"Failed to dump debug tensor: {e}")
 
         return denoised_pred
 

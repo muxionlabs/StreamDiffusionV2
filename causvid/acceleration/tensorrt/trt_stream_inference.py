@@ -31,7 +31,7 @@ class TRTCausalStreamInferencePipeline(CausalStreamInferencePipeline):
     batching, text encoding, VAE) remains identical.
     """
     
-    def __init__(self, args, device: str, engine_path: str = None):
+    def __init__(self, args, device: str, engine_path: str = None, debug_dump=None):
         """
         Initialize TRT pipeline.
         
@@ -40,10 +40,11 @@ class TRTCausalStreamInferencePipeline(CausalStreamInferencePipeline):
             device: CUDA device string
             engine_path: Path to serialized TRT .engine file.
                         If None, looks for args.engine_path
+            debug_dump: Path to dump debug tensors
         """
         # Initialize parent — this sets up text_encoder, vae, and the
         # PyTorch generator. We'll replace the generator below.
-        super().__init__(args=args, device=device)
+        super().__init__(args=args, device=device, debug_dump=debug_dump)
         
         # Determine engine path
         if engine_path is None:

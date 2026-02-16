@@ -135,10 +135,10 @@ class SingleGPUInferencePipeline:
             )
             self.logger.info(f"Using TRT engine: {engine_path}")
             self.pipeline = TRTCausalStreamInferencePipeline(
-                config, device=str(device), engine_path=engine_path)
+                args, device=str(device), engine_path=engine_path, debug_dump=debug_dump)
             self.pipeline.to(device=str(device), dtype=torch.bfloat16)
         else:
-            self.pipeline = CausalStreamInferencePipeline(config, device=str(device))
+            self.pipeline = CausalStreamInferencePipeline(args, device=str(device), debug_dump=debug_dump)
             self.pipeline.to(device=str(device), dtype=torch.bfloat16)
         
         # Performance tracking
@@ -366,6 +366,17 @@ class SingleGPUInferencePipeline:
         self.logger.info(f"DiT Average FPS: {np.mean(np.array(dit_fps_list)):.4f}")
         self.logger.info(f"Video shape: {video.shape}, Average FPS: {fps_avg:.4f}")
         
+        if args.debug_dump:
+            import os
+            os.makedirs(args.debug_dump, exist_ok=True)
+            # Convert numpy array back to torch tensor for saving if it was a numpy array
+            # Assuming 'video' is a numpy array at this point from np.concatenate
+            torch.save(torch.from_numpy(video), os.path.join(args.debug_dump, "vae_decoded_output.pt"))
+
+        if args.engine == "trt":
+            # Just save raw video for now
+            pass
+
         output_path = os.path.join(output_folder, f"output_{0:03d}.mp4")
         export_to_video(video, output_path, fps=fps)
         self.logger.info(f"Video saved to: {output_path}")
@@ -389,6 +400,8 @@ def main():
     parser.add_argument("--step", type=int, default=2, help="Step")
     parser.add_argument("--model_type", type=str, default="T2V-1.3B", help="Model type (e.g., T2V-1.3B)")
     parser.add_argument("--num_frames", type=int, default=81, help="Video length (number of frames)")
+    parser.add_argument("--offload_model", action="store_true")
+    parser.add_argument("--debug_dump", type=str, default=None, help="Path to dump debug tensors")
     parser.add_argument("--fixed_noise_scale", action="store_true", default=False)
     parser.add_argument("--img2img", action="store_true", default=False, help="Enable img2img mode: extract a single frame from img2vid output.")
     parser.add_argument("--engine", type=str, default="pytorch", choices=["pytorch", "trt"],
