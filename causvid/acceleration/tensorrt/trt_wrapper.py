@@ -352,9 +352,22 @@ class TRTWanDiffusionWrapper(nn.Module):
         
         full_freqs = rope_params(max_seq_len, self.head_dim).to(device) # [Seq, 64] complex
         
-        freqs_t = full_freqs[:, :c_t]           # High (0-22)
-        freqs_h = freqs_t.clone()               # High (0-22) - ALIAS
-        freqs_w = freqs_t.clone()               # High (0-22) - ALIAS
+        freqs_t = full_freqs[:, :c_t]           # High (22)
+        
+        # Dimensions mismatch:
+        # freqs_t is size 22 (c_t).
+        # Height is size 21 (c_h).
+        # Width is size 21 (c_w).
+        # We must slice the High Frequencies to fit the inputs.
+        
+        freqs_h = freqs_t[:, :c_h]              # High (21) - ALIAS
+        freqs_w = freqs_t[:, :c_w]              # High (21) - ALIAS
+        
+        print(f"[DEBUG_ROPE] c_t={c_t} c_h={c_h} c_w={c_w}")
+        print(f"[DEBUG_ROPE] freqs_t shape: {freqs_t.shape}")
+        print(f"[DEBUG_ROPE] freqs_h shape: {freqs_h.shape}")
+        print(f"[DEBUG_ROPE] freqs_w shape: {freqs_w.shape}")
+        
         # ------------------------------------
         # ------------------------------------
 
