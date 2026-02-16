@@ -350,23 +350,57 @@ class TRTWanDiffusionWrapper(nn.Module):
         #    - If this works here, Runtime Injection is OK, and Med/Low Freqs are the problem.
         #    - If this FAILS, Runtime Injection is BROKEN.
         
+        # 7. SYNTHETIC SCALING STRATEGY
+        #    - High Freqs (Time) are STABLE.
+        #    - Med/Low Freqs (Space) are UNSTABLE (Green Grass).
+        #    - We need lower frequencies for Space to avoid "Disfigured Dog".
+        #    - Strategy: Generate Synthetic Med/Low freq values by scaling the Safe Time band.
+        #    - If specific values cause crash, we can tune the scale factor.
+        
         full_freqs = rope_params(max_seq_len, self.head_dim).to(device) # [Seq, 64] complex
         
-        freqs_t = full_freqs[:, :c_t]           # High (22)
+        # Base: High Frequencies (Indices 0-22)
+        freqs_base = full_freqs[:, :c_t] 
         
-        # Dimensions mismatch:
-        # freqs_t is size 22 (c_t).
-        # Height is size 21 (c_h).
-        # Width is size 21 (c_w).
-        # We must slice the High Frequencies to fit the inputs.
+        # 1. Time: Use Base directly (High Freqs)
+        freqs_t = freqs_base
         
-        freqs_h = freqs_t[:, :c_h]              # High (21) - ALIAS
-        freqs_w = freqs_t[:, :c_w]              # High (21) - ALIAS
+        # 2. Height: Target Med Freqs. 
+        #    - Rope decay is 10000^(-i/d). 
+        #    - Band 2 (Mid) is roughly 1/10th of Band 1.
+        #    - Let's try Divide by 10.0. 
+        #    - Crucial: Must match dimensions [1024, 21].
+        freqs_h_base = freqs_base[:, :c_h] # Slice to 21
+        scale_h = 10.0
+        # To scale FREQUENCY, we divide the ANGLE. 
+        # rope_params returns e^(i * theta). theta = pos * freq.
+        # We need to reconstruct the angle or scale the freq before polar.
+        # Wait, rope_params returns complex numbers (cos, sin). We can't just divide them.
+        # We must regenerate them from scratch or use `pow`? No.
+        # EASIER: Generate angles manually.
         
-        print(f"[DEBUG_ROPE] c_t={c_t} c_h={c_h} c_w={c_w}")
+        # Re-implement simple angle generation for runtime control
+        def get_freqs_manually(seq_len, dim, theta=10000.0, scale=1.0):
+             freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device).float() / self.head_dim))
+             freqs = freqs / scale # Apply Manual Scaling
+             t = torch.arange(seq_len, device=device).float()
+             freqs = torch.outer(t, freqs) # [Seq, Dim/2]
+             freqs_complex = torch.polar(torch.ones_like(freqs), freqs)
+             return freqs_complex
+
+        # Generate Safe Bands manually
+        freqs_t_complex = get_freqs_manually(max_seq_len, c_t * 2, scale=1.0)
+        freqs_h_complex = get_freqs_manually(max_seq_len, c_h * 2, scale=10.0) # Approx Med
+        freqs_w_complex = get_freqs_manually(max_seq_len, c_w * 2, scale=50.0) # Approx Low
+        
+        freqs_t = freqs_t_complex
+        freqs_h = freqs_h_complex
+        freqs_w = freqs_w_complex
+
+        print(f"[DEBUG_ROPE] SYNTHETIC SCALING ACTIVE")
         print(f"[DEBUG_ROPE] freqs_t shape: {freqs_t.shape}")
-        print(f"[DEBUG_ROPE] freqs_h shape: {freqs_h.shape}")
-        print(f"[DEBUG_ROPE] freqs_w shape: {freqs_w.shape}")
+        print(f"[DEBUG_ROPE] freqs_h shape: {freqs_h.shape} (Scale 10.0)")
+        print(f"[DEBUG_ROPE] freqs_w shape: {freqs_w.shape} (Scale 50.0)")
         
         # ------------------------------------
         # ------------------------------------
