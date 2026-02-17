@@ -204,6 +204,26 @@ class SingleGPUInferencePipeline:
 
         if is_trt and hasattr(generator, 'crossattn_modules'):
              self.logger.info("Manually loading cross-attention modules for TRT wrapper")
+             
+             # 0. Load Text Embedding MLP (Missing in previous version!)
+             if hasattr(generator, 'text_embedding') and generator.text_embedding is not None:
+                 self.logger.info("Manually loading text_embedding for TRT wrapper")
+                 # We expect keys: "text_embedding.0.weight", etc.
+                 # State dict has them (stripped of "model." prefix).
+                 prefix = "text_embedding"
+                 
+                 # Layer 0
+                 if f"{prefix}.0.weight" in state_dict:
+                     generator.text_embedding[0].weight.data.copy_(state_dict[f"{prefix}.0.weight"])
+                     generator.text_embedding[0].bias.data.copy_(state_dict[f"{prefix}.0.bias"])
+                 
+                 # Layer 2 (Linear) - Layer 1 is GELU
+                 if f"{prefix}.2.weight" in state_dict:
+                     generator.text_embedding[2].weight.data.copy_(state_dict[f"{prefix}.2.weight"])
+                     generator.text_embedding[2].bias.data.copy_(state_dict[f"{prefix}.2.bias"])
+                 
+                 self.logger.info("Loaded text_embedding weights")
+
              count_loaded = 0
              # generator.crossattn_modules is a list of dicts: [{'k': mod, 'v': mod, 'norm_k': mod}, ...]
              for i, mod_dict in enumerate(generator.crossattn_modules):
