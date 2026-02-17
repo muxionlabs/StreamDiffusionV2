@@ -360,26 +360,21 @@ class TRTWanDiffusionWrapper(nn.Module):
         full_freqs = rope_params(max_seq_len, self.head_dim).to(device) # [Seq, 64] complex
         
         # Base: High Frequencies (Indices 0-22)
-        freqs_base = full_freqs[:, :c_t] 
+        # freqs_base = full_freqs[:, :c_t] 
         
-        # 1. Time: Use Base directly (High Freqs)
-        freqs_t = freqs_base
+        # 4. TRUE BASELINE (Restore)
+        freqs_t = full_freqs[:, :c_t]
+        freqs_h = full_freqs[:, c_t:c_t+c_h]
+        freqs_w = full_freqs[:, c_t+c_h:]
         
-        # 2. Height: Target Med Freqs. 
-        #    - Rope decay is 10000^(-i/d). 
-        #    - Band 2 (Mid) is roughly 1/10th of Band 1.
-        #    - Let's try Divide by 10.0. 
-        #    - Crucial: Must match dimensions [1024, 21].
-        freqs_h_base = freqs_base[:, :c_h] # Slice to 21
-        scale_h = 10.0
-        # To scale FREQUENCY, we divide the ANGLE. 
-        # rope_params returns e^(i * theta). theta = pos * freq.
-        # We need to reconstruct the angle or scale the freq before polar.
-        # Wait, rope_params returns complex numbers (cos, sin). We can't just divide them.
-        # We must regenerate them from scratch or use `pow`? No.
-        # EASIER: Generate angles manually.
-        
-        # Re-implement simple angle generation for runtime control
+        print(f"[DEBUG_ROPE] TRUE BASELINE ACTIVE")
+        print(f"[DEBUG_ROPE] freqs_t shape: {freqs_t.shape}")
+        print(f"[DEBUG_ROPE] freqs_h shape: {freqs_h.shape}")
+        print(f"[DEBUG_ROPE] freqs_w shape: {freqs_w.shape}")
+
+        '''
+        # 7. SYNTHETIC SCALING STRATEGY (DISABLED)
+        # ...
         def get_freqs_manually(seq_len, dim, theta=10000.0, scale=1.0):
              freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device).float() / self.head_dim))
              freqs = freqs / scale # Apply Manual Scaling
@@ -396,6 +391,7 @@ class TRTWanDiffusionWrapper(nn.Module):
         freqs_t = freqs_t_complex
         freqs_h = freqs_h_complex
         freqs_w = freqs_w_complex
+        '''
 
         print(f"[DEBUG_ROPE] SYNTHETIC SCALING ACTIVE")
         print(f"[DEBUG_ROPE] freqs_t shape: {freqs_t.shape}")
