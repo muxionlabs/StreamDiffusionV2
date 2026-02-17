@@ -632,6 +632,9 @@ class TRTWanDiffusionWrapper(nn.Module):
             # Apply text embedding MLP: [B, text_len, C_text] → [B, text_len, dim]
             ctx = self.text_embedding(context.to(next(self.text_embedding.parameters()).dtype))
             
+            print(f"[TRT_DEBUG] Text Embed Mean: {ctx.float().mean().item():.6f}, Std: {ctx.float().std().item():.6f}")
+            print(f"[TRT_DEBUG] Text Embed [0,0,0]: {ctx[0,0,0].item():.6f}")
+            
             B = ctx.shape[0]
             N, D = self.num_heads, self.head_dim
             
