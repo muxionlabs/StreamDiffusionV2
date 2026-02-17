@@ -24,23 +24,16 @@ def test_rope_parity():
     # We can inspect the code or instantiate a dummy wrapper context
     
     # Replicating the logic from trt_wrapper.py (True Baseline)
-    c_t = head_dim // 3
-    c_h = head_dim // 3
-    c_w = head_dim // 3 # roughly
+    # In trt_wrapper.py, we typically see:
+    # half_dim = head_dim // 2
+    # c_h = half_dim // 3
+    # c_w = half_dim // 3
+    # c_t = half_dim - c_h - c_w
     
-    # In trt_wrapper.py:
-    # full_freqs = rope_params(max_seq_len, self.head_dim).to(device)
-    # freqs_t = full_freqs[:, :c_t]
-    # freqs_h = full_freqs[:, c_t:c_t+c_h]
-    # freqs_w = full_freqs[:, c_t+c_h:]
-    
-    # Let's verify the slice indices match exactly what the model expects
-    # In wan/wan_base/modules/model.py:
-    # freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
-    
-    c = head_dim
+    half_dim = head_dim // 2
+    c = half_dim
     split_sizes = [c - 2 * (c // 3), c // 3, c // 3]
-    print(f"Original Split Sizes: {split_sizes}")
+    print(f"Original Split Sizes (based on half_dim={half_dim}): {split_sizes}")
     
     freqs_split_ref = full_freqs_ref.split(split_sizes, dim=1)
     ref_t = freqs_split_ref[0]
@@ -51,27 +44,43 @@ def test_rope_parity():
     print(f"Ref H shape: {ref_h.shape}")
     print(f"Ref W shape: {ref_w.shape}")
 
-    # Now check what TRT wrapper does (based on my recent edit)
-    # c_t = head_dim // 3
-    # c_h = head_dim // 3
-    # c_w = head_dim // 3 NOTE: This might be the bug! 
-    # If head_dim=64, 64//3 = 21. 
-    # 21 + 21 + 21 = 63. Missing 1 dimension!
+    # Now check what TRT wrapper does
+    # If trt_wrapper.py uses head_dim // 3 instead of half_dim // 3, that would be the bug.
     
-    trt_c_t = head_dim // 3
-    trt_c_h = head_dim // 3
-    trt_c_w = head_dim // 3
+    trt_c_h = half_dim // 3
+    trt_c_w = half_dim // 3
+    trt_c_t = half_dim - trt_c_h - trt_c_w # This is how it should be
     
-    print(f"TRT Wrapper Calculated Sizes: c_t={trt_c_t}, c_h={trt_c_h}, c_w={trt_c_w}")
-    print(f"Sum: {trt_c_t + trt_c_h + trt_c_w} vs Expected {head_dim}")
+    # But let's verify what I put in the actual file.
+    # In Step 962, I saw:
+    # c_h = half_dim // 3
+    # c_w = half_dim // 3
     
-    if (trt_c_t + trt_c_h + trt_c_w) != head_dim:
-        print("!!! DETECTED DIMENSION MISMATCH IN TRT WRAPPER LOGIC !!!")
-        print("Model split logic: [c - 2*(c//3), c//3, c//3]")
-        print(f"Model T size: {split_sizes[0]}")
-        
+    print(f"TRT Wrapper Calculated Sizes (should match): c_t={trt_c_t}, c_h={trt_c_h}, c_w={trt_c_w}")
+    
+    if split_sizes != [trt_c_t, trt_c_h, trt_c_w]:
+        print("!!! DETECTED LOGIC MISMATCH !!!")
+        print(f"Reference: {split_sizes}")
+        print(f"TRT Wrapper: {[trt_c_t, trt_c_h, trt_c_w]}")
     else:
-        print("Dimension logic matches (unexpected based on my manual calculation)")
+        print("Dimension logic matches.")
+        
+    # Check values
+    # In trt_wrapper, we do:
+    # freqs_t = full_freqs[:, :c_t]
+    # freqs_h = full_freqs[:, c_t:c_t+c_h]
+    # freqs_w = full_freqs[:, c_t+c_h:]
+    
+    # Reference split does:
+    # ref_t = freqs_split_ref[0] which is full_freqs[:, :split_sizes[0]]
+    # ref_h = freqs_split_ref[1] which is full_freqs[:, split_sizes[0]:split_sizes[0]+split_sizes[1]]
+    
+    # So if split sizes match, the slicing logic is identical.
+    
+    # Let's verify if RoPE params generation is identical
+    # trt_wrapper call: rope_params(max_seq_len, self.head_dim)
+    # reference call: rope_params(max_seq_len, head_dim)
+    # Identical.
 
 if __name__ == "__main__":
     test_rope_parity()
