@@ -368,7 +368,6 @@ class SingleGPUInferencePipeline:
         self.logger.info(f"Video shape: {video.shape}, Average FPS: {fps_avg:.4f}")
         
         if args.debug_dump:
-            import os
             os.makedirs(args.debug_dump, exist_ok=True)
             # Convert numpy array back to torch tensor for saving if it was a numpy array
             # Assuming 'video' is a numpy array at this point from np.concatenate
