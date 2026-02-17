@@ -608,6 +608,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
                 for u in context
             ]))
+        
+        print(f"[PT_DEBUG] Text Embed Mean: {context.float().mean().item():.6f}, Std: {context.float().std().item():.6f}")
+        print(f"[PT_DEBUG] Text Embed [0,0,0]: {context[0,0,0].item():.6f}")
 
         if clip_fea is not None:
             # Use appropriate embedding layer based on model type
