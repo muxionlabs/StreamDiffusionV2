@@ -367,15 +367,17 @@ class SingleGPUInferencePipeline:
         self.logger.info(f"DiT Average FPS: {np.mean(np.array(dit_fps_list)):.4f}")
         self.logger.info(f"Video shape: {video.shape}, Average FPS: {fps_avg:.4f}")
         
-        if args.debug_dump:
-            os.makedirs(args.debug_dump, exist_ok=True)
+        if self.debug_dump:
+            os.makedirs(self.debug_dump, exist_ok=True)
             # Convert numpy array back to torch tensor for saving if it was a numpy array
             # Assuming 'video' is a numpy array at this point from np.concatenate
-            torch.save(torch.from_numpy(video), os.path.join(args.debug_dump, "vae_decoded_output.pt"))
+            torch.save(torch.from_numpy(video), os.path.join(self.debug_dump, "vae_decoded_output.pt"))
 
-        if args.engine == "trt":
+        engine = getattr(self.config, 'engine', 'pytorch')
+        if engine == "trt":
             # Just save raw video for now
             pass
+
 
         output_path = os.path.join(output_folder, f"output_{0:03d}.mp4")
         export_to_video(video, output_path, fps=fps)
