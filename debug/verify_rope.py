@@ -40,6 +40,13 @@ def test_rope_parity():
         split_sizes = [c - 2 * (c // 3), c // 3, c // 3]
         print(f"Reference Split Sizes: {split_sizes}")
         
+        # GENERATE REFERENCE VALUES
+        full_freqs_ref = rope_params_orig(max_seq_len, head_dim).to(device)
+        freqs_split_ref = full_freqs_ref.split(split_sizes, dim=1)
+        ref_t = freqs_split_ref[0]
+        ref_h = freqs_split_ref[1]
+        ref_w = freqs_split_ref[2]
+        
         # TRT Logic
         trt_c_h = half_dim // 3
         trt_c_w = half_dim // 3
