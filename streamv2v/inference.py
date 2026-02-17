@@ -410,9 +410,20 @@ def main():
                        help="Inference engine: 'pytorch' (default) or 'trt' (TensorRT)")
     parser.add_argument("--engine_path", type=str, default=None,
                        help="Path to TRT engine file (required when --engine trt)")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     args = parser.parse_args()
     
     torch.set_grad_enabled(False)
+    
+    # Set seed for reproducibility
+    import random
+    import numpy as np
+    seed = args.seed
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    print(f"[INFO] Using random seed: {seed}")
 
     import time
     # Global timing start
