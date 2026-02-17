@@ -8,7 +8,10 @@ def inspect_checkpoint(ckpt_path):
     
     print(f"Top-level keys: {list(ckpt.keys())}")
     
-    if isinstance(ckpt, dict) and 'state_dict' in ckpt:
+    if isinstance(ckpt, dict) and 'generator' in ckpt:
+        sd = ckpt['generator']
+        print("Using 'generator' key.")
+    elif isinstance(ckpt, dict) and 'state_dict' in ckpt:
         sd = ckpt['state_dict']
         print("Using 'state_dict' key.")
     elif isinstance(ckpt, dict) and 'model' in ckpt:
