@@ -249,9 +249,9 @@ class TRTWanDiffusionWrapper(nn.Module):
             max_valid = max(max_valid, min_cache)  # respect engine minimum
             
             # Prepare RoPE inputs (Runtime configurable!)
-            # We can now change frequencies per-forward call if needed.
-            # Defaulting to Factor 30.0 (Time) for smooth motion.
-            rope_inputs = self._get_rope_inputs(engine_dtype, self.device)
+            # Dynamic RoPE: Ensure buffer covers the current maximum position index.
+            req_rope_len = int(new_local_end.max().item())
+            rope_inputs = self._get_rope_inputs(engine_dtype, self.device, req_rope_len)
 
             single_inputs = {
                 'x': x[b:b+1].to(engine_dtype),
@@ -319,21 +319,30 @@ class TRTWanDiffusionWrapper(nn.Module):
         
         return pred_x0
 
-    def _get_rope_inputs(self, dtype, device):
+    def _get_rope_inputs(self, dtype, device, min_seq_len):
         """
         Generate RoPE frequency tensors. 
-        Refactored to be generated at runtime.
+        Refactored to be generated at runtime and resized dynamically.
         """
         # Cache key based on dtype/device
         cache_key = (dtype, device)
-        if hasattr(self, '_rope_cache') and self._rope_cache.get('key') == cache_key:
-             return self._rope_cache['tensors']
-
+        current_cache = getattr(self, '_rope_cache', None)
+        
+        # Check if cache exists and is large enough
+        if current_cache and current_cache.get('key') == cache_key:
+             if current_cache['max_len'] >= min_seq_len:
+                 return current_cache['tensors']
+                 
         # Import RoPE logic (reuse logic from trt_model)
         from causvid.acceleration.tensorrt.trt_model import rope_params
         
         head_dim = self.head_dim
-        max_seq_len = 1024 # Sufficient for frequencies
+        # Dynamic allocation with buffer to avoid frequent re-generation
+        # Round up to next multiple of 4096 or add buffer
+        alloc_len = max(min_seq_len + 4096, 4096)
+        max_seq_len = alloc_len
+        
+        print(f"[TRT_WRAPPER] Generating RoPE cache for length {max_seq_len} (Req: {min_seq_len})")
         
         half_dim = head_dim // 2
         c_t = half_dim - 2 * (half_dim // 3)
@@ -393,24 +402,7 @@ class TRTWanDiffusionWrapper(nn.Module):
         freqs_w = freqs_w_complex
         '''
 
-        print(f"[DEBUG_ROPE] SYNTHETIC SCALING ACTIVE")
-        print(f"[DEBUG_ROPE] freqs_t shape: {freqs_t.shape}")
-        print(f"[DEBUG_ROPE] freqs_h shape: {freqs_h.shape} (Scale 10.0)")
-        print(f"[DEBUG_ROPE] freqs_w shape: {freqs_w.shape} (Scale 50.0)")
-        
-        # ------------------------------------
-        # ------------------------------------
-
-        rope_inputs = {
-            'rope_cos_t': freqs_t.real.to(dtype=torch.float32).contiguous(), # Keep float32 for safety
-            'rope_sin_t': freqs_t.imag.to(dtype=torch.float32).contiguous(),
-            'rope_cos_h': freqs_h.real.to(dtype=torch.float32).contiguous(),
-            'rope_sin_h': freqs_h.imag.to(dtype=torch.float32).contiguous(),
-            'rope_cos_w': freqs_w.real.to(dtype=torch.float32).contiguous(),
-            'rope_sin_w': freqs_w.imag.to(dtype=torch.float32).contiguous(),
-        }
-        
-        self._rope_cache = {'key': cache_key, 'tensors': rope_inputs}
+        self._rope_cache = {'key': cache_key, 'max_len': max_seq_len, 'tensors': rope_inputs}
         return rope_inputs
 
     def _update_pipeline_cache(self, kv_cache, out_k, out_v, local_end_indices, B, b_idx):
