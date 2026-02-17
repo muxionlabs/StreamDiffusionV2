@@ -402,6 +402,15 @@ class TRTWanDiffusionWrapper(nn.Module):
         freqs_w = freqs_w_complex
         '''
 
+        rope_inputs = {
+            'rope_cos_t': freqs_t.real.to(dtype=torch.float32).contiguous(), # Keep float32 for safety
+            'rope_sin_t': freqs_t.imag.to(dtype=torch.float32).contiguous(),
+            'rope_cos_h': freqs_h.real.to(dtype=torch.float32).contiguous(),
+            'rope_sin_h': freqs_h.imag.to(dtype=torch.float32).contiguous(),
+            'rope_cos_w': freqs_w.real.to(dtype=torch.float32).contiguous(),
+            'rope_sin_w': freqs_w.imag.to(dtype=torch.float32).contiguous(),
+        }
+
         self._rope_cache = {'key': cache_key, 'max_len': max_seq_len, 'tensors': rope_inputs}
         return rope_inputs
 
