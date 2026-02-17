@@ -60,6 +60,53 @@ def test_rope_parity():
              # Check if [22, 21, 21] logic holds
              if trt_splits == [22, 21, 21]:
                  print(">> Confirmed: head_dim=128 produces the [22, 21, 21] split seen in logs.")
+                 
+             # Value Inspection for Numerical Stability
+             print("\n--- Inspecting Values ---")
+             
+             # Reference Frequencies
+             freqs_t, freqs_h, freqs_w = ref_t, ref_h, ref_w
+             
+             # Calculate magnitudes (should be 1.0 for polar form? No, these are freqs * pos)
+             # Wait, rope_params returns complex numbers: exp(i * theta)
+             # theta = pos * freq
+             # absolute value is always 1.0. This is rotational.
+             # So freqs themselves ARE NOT the issue for overflow/underflow in values, but their rotations are.
+             # Wait, in the TRT wrapper we pass:
+             # 'rope_cos_t': freqs_t.real.to(dtype=torch.float32)
+             # 'rope_sin_t': freqs_t.imag.to(dtype=torch.float32)
+             
+             # Let's check min/max/mean of the real/imag parts.
+             # They should be in [-1, 1].
+             
+             print(f"Freqs T (Real): Min={freqs_t.real.min():.4f}, Max={freqs_t.real.max():.4f}, Mean={freqs_t.real.mean():.4f}")
+             print(f"Freqs H (Real): Min={freqs_h.real.min():.4f}, Max={freqs_h.real.max():.4f}, Mean={freqs_h.real.mean():.4f}")
+             print(f"Freqs W (Real): Min={freqs_w.real.min():.4f}, Max={freqs_w.real.max():.4f}, Mean={freqs_w.real.mean():.4f}")
+             
+             # But wait! rope_params returns the PRECOMPUTED COS/SIN factors (i.e., rotation matrices).
+             # It computes:
+             # freqs = torch.outer(pos, 1.0 / theta^(2i/d))
+             # then returns polar(1, freqs).
+             # So the values ARE ALWAYS ON THE UNIT CIRCLE.
+             # Their magnitude IS 1.0.
+             
+             mag_t = freqs_t.abs()
+             mag_h = freqs_h.abs()
+             mag_w = freqs_w.abs()
+             
+             print(f"Freqs T Magnitude: Min={mag_t.min():.6f}, Max={mag_t.max():.6f}")
+             print(f"Freqs H Magnitude: Min={mag_h.min():.6f}, Max={mag_h.max():.6f}")
+             print(f"Freqs W Magnitude: Min={mag_w.min():.6f}, Max={mag_w.max():.6f}")
+             
+             # If magnitude != 1.0, then something is wrong with rope_params.
+             # If magnitude == 1.0, then INPUTS to TRT are fine (range [-1, 1]).
+             # The instability comes from the Attention operation ITSELF using these rotations.
+             
+             # Alternatively, maybe the frequencies (theta values) are causing aliasing?
+             # Let's inspect the RAW THETA values if possible? 
+             # No, we only have the complex outputs.
+             
+             pass
 
 
 if __name__ == "__main__":
