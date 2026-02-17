@@ -145,6 +145,12 @@ def build_engine(
         min=(min_batch, num_layers, text_len, num_heads, head_dim),
         opt=(opt_batch, num_layers, text_len, num_heads, head_dim),
         max=(max_batch, num_layers, text_len, num_heads, head_dim))
+
+    # text_mask: [batch, 1, 1, text_len]
+    profile.set_shape('text_mask',
+        min=(min_batch, 1, 1, text_len),
+        opt=(opt_batch, 1, 1, text_len),
+        max=(max_batch, 1, 1, text_len))
     
     # RoPE inputs: [freq_len, dim]
     # We used freq_len=1024 in export. 

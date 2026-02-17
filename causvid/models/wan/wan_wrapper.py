@@ -55,7 +55,8 @@ class WanTextEncoder(TextEncoderInterface):
             u[v:] = 0.0  # set padding to 0.0
 
         return {
-            "prompt_embeds": context
+            "prompt_embeds": context,
+            "attention_mask": mask
         }
 
 
