@@ -115,6 +115,7 @@ def create_dummy_inputs(
                                        num_heads, head_dim, device=device, dtype=dtype),
         'all_crossattn_v': torch.randn(batch_size, num_layers, text_len,
                                        num_heads, head_dim, device=device, dtype=dtype),
+        'text_mask': torch.zeros(batch_size, 1, 1, text_len, device=device, dtype=dtype),
         **rope_inputs # Add RoPE inputs
     }
     
@@ -182,7 +183,7 @@ def export_to_onnx(
     input_names = [
         'x', 'timestep', 'context', 'current_start', 'current_end',
         'all_kv_k', 'all_kv_v', 'all_kv_seq_lens', 'all_local_start_indices',
-        'all_crossattn_k', 'all_crossattn_v',
+        'all_crossattn_k', 'all_crossattn_v', 'text_mask',
         'rope_cos_t', 'rope_sin_t', 'rope_cos_h', 'rope_sin_h', 'rope_cos_w', 'rope_sin_w'
     ]
     
@@ -214,6 +215,7 @@ def export_to_onnx(
         'all_local_start_indices': {0: 'batch'},
         'all_crossattn_k': {0: 'batch'},
         'all_crossattn_v': {0: 'batch'},
+        'text_mask': {0: 'batch'},
         # RoPE inputs are fixed size (usually 1024 or MAX_SEQ_LEN).
         # We can make distinct axes dynamic if we want to change max length.
         'rope_cos_t': {0: 'freq_len'},

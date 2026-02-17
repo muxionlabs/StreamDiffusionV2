@@ -347,12 +347,14 @@ class TRTCrossAttention(nn.Module):
         x: torch.Tensor,
         crossattn_k: torch.Tensor,
         crossattn_v: torch.Tensor,
+        attn_mask: torch.Tensor = None,
     ):
         """
         Args:
             x: [B, S, C] — query input
             crossattn_k: [B, ctx_len, num_heads, head_dim] — cached context keys
             crossattn_v: [B, ctx_len, num_heads, head_dim] — cached context values
+            attn_mask: [B, 1, 1, ctx_len] or similar — optional mask
             
         Returns:
             output: [B, S, C]
@@ -369,7 +371,7 @@ class TRTCrossAttention(nn.Module):
         
         out = F.scaled_dot_product_attention(
             q_sdpa, k_sdpa, v_sdpa,
-            attn_mask=None,
+            attn_mask=attn_mask,
             is_causal=False,
             dropout_p=0.0,
         )  # [B, N, S, D]
@@ -437,6 +439,7 @@ class TRTAttentionBlock(nn.Module):
         local_start_index: torch.Tensor,
         crossattn_k: torch.Tensor,
         crossattn_v: torch.Tensor,
+        cross_attn_mask: torch.Tensor = None,
         start_frame: int = 0,
     ):
         """
@@ -449,6 +452,7 @@ class TRTAttentionBlock(nn.Module):
             kv_seq_len: [B] — valid cache length
             local_start_index: [B] — write position in cache
             crossattn_k, crossattn_v: [B, ctx_len, N, D] — precomputed cross-attn KV
+            cross_attn_mask: [B, 1, 1, ctx_len] — mask for text tokens
             start_frame: frame offset
             
         Returns:
@@ -483,7 +487,7 @@ class TRTAttentionBlock(nn.Module):
         x = x + (y_reshaped * e_mod[2]).reshape(B, S, C)
         
         # Cross-attention
-        x = x + self.cross_attn(self.norm3(x), crossattn_k, crossattn_v)
+        x = x + self.cross_attn(self.norm3(x), crossattn_k, crossattn_v, attn_mask=cross_attn_mask)
         
         # FFN with modulation
         x_normed2 = self.norm2(x).reshape(B, num_frames, frame_seqlen, C)
@@ -665,6 +669,8 @@ class TRTCausalWanModel(nn.Module):
         # Flattened cross-attn cache: [B, num_layers, ctx_len, num_heads, head_dim]
         all_crossattn_k: torch.Tensor,
         all_crossattn_v: torch.Tensor,
+        # Mask
+        text_mask: torch.Tensor,
         # Dynamic RoPE inputs
         rope_cos_t: torch.Tensor,
         rope_sin_t: torch.Tensor,
@@ -751,6 +757,7 @@ class TRTCausalWanModel(nn.Module):
                 rope_cos_w, rope_sin_w,
                 layer_kv_k, layer_kv_v, layer_seq_len, layer_start,
                 layer_cross_k, layer_cross_v,
+                cross_attn_mask=text_mask,
                 start_frame=start_frame_idx,
             )
             
