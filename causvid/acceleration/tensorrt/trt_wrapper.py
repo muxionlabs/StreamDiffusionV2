@@ -250,7 +250,17 @@ class TRTWanDiffusionWrapper(nn.Module):
             
             # Prepare RoPE inputs (Runtime configurable!)
             # Dynamic RoPE: Ensure buffer covers the current maximum position index.
-            req_rope_len = int(new_local_end.max().item())
+            # CRITICAL FIX: RoPE tensors are indexed by (F, H, W) grid positions, NOT flattened token indices.
+            # Max index needed is max(current_frame_idx + num_input_frames, H, W).
+            # H, W are small (~30, ~50). Frame index grows.
+            f_start = (current_start[b] // frame_seq_len).item()
+            req_rope_len = int(f_start) + num_input_frames + 1 
+            
+            # TRT Engine Profile has a HARD LIMIT of 4096 on these inputs.
+            # We must clamp the request to 4096 to avoid instant crash.
+            # If video > 4096 frames, we will crash anyway (engine limitation), but let's be safe.
+            req_rope_len = min(req_rope_len, 4096)
+            
             rope_inputs = self._get_rope_inputs(engine_dtype, self.device, req_rope_len)
 
             single_inputs = {
@@ -339,7 +349,12 @@ class TRTWanDiffusionWrapper(nn.Module):
         head_dim = self.head_dim
         # Dynamic allocation with buffer to avoid frequent re-generation
         # Round up to next multiple of 4096 or add buffer
-        alloc_len = max(min_seq_len + 4096, 4096)
+        alloc_len = max(min_seq_len + 1024, 1024) # Smaller buffer is fine
+        
+        # HARD LIMIT: TRT Engine Profile max is 4096.
+        # We cannot generate or pass a tensor > 4096.
+        alloc_len = min(alloc_len, 4096)
+        
         max_seq_len = alloc_len
         
         print(f"[TRT_WRAPPER] Generating RoPE cache for length {max_seq_len} (Req: {min_seq_len})")
