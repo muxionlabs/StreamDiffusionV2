@@ -608,7 +608,7 @@ class TRTWanDiffusionWrapper(nn.Module):
         
         return all_k, all_v
     
-    def _precompute_crossattn_kv(self, context, crossattn_cache):
+    def _precompute_crossattn_kv(self, context, crossattn_cache, conditional_dict=None):
         """
         Pre-compute cross-attention K,V from text context.
         
@@ -619,6 +619,7 @@ class TRTWanDiffusionWrapper(nn.Module):
         Args:
             context: [B, text_len, C_text] — raw text embeddings
             crossattn_cache: list of dicts per block
+            conditional_dict: optional dict containing attention_mask
         """
         if self.text_embedding is None or self.crossattn_modules is None:
             logger.warning(
@@ -639,7 +640,7 @@ class TRTWanDiffusionWrapper(nn.Module):
             N, D = self.num_heads, self.head_dim
             
             # Prepare text mask
-            if 'attention_mask' in conditional_dict:
+            if conditional_dict is not None and 'attention_mask' in conditional_dict:
                  # [B, L] -> [B, 1, 1, L]
                  text_mask = conditional_dict['attention_mask'].view(B, 1, 1, -1).to(dtype=ctx.dtype)
                  # In PyTorch, mask is 0 for keep, -inf for mask. 
