@@ -638,6 +638,72 @@ class TRTWanDiffusionWrapper(nn.Module):
             B = ctx.shape[0]
             N, D = self.num_heads, self.head_dim
             
+            # Prepare text mask
+            if 'attention_mask' in conditional_dict:
+                 # [B, L] -> [B, 1, 1, L]
+                 text_mask = conditional_dict['attention_mask'].view(B, 1, 1, -1).to(dtype=ctx.dtype)
+                 # In PyTorch, mask is 0 for keep, -inf for mask. 
+                 # WanTextEncoder returns 1 for keep, 0 for padding.
+                 # So we need (1 - mask) * -1e4
+                 text_mask = (1.0 - text_mask) * -65504.0
+            else:
+                 # Fallback: assume all valid if no mask provided
+                 text_mask = torch.zeros(B, 1, 1, ctx.shape[1], device=ctx.device, dtype=ctx.dtype)
+
+            # 2. Get RoPE inputs (cached or generated)
+            # We need RoPE for the *current* frame(s).
+            # The engine expects full rope buffers of length 1024 (or whatever freq_len is)
+            # The slicing happens inside the engine based on grid_sizes.
+            # We just need to ensure the cache is large enough and pass it.
+             
+            # Calculate required length (max frame index + seq len)
+            # This is global frame index
+            max_frame_idx = (current_end.max().item() // (480//8//2 * 832//8//2)) + 1
+            # Actually, the engine uses frame_idx calculated from current_start
+            # We just need enough frequencies. 
+            # In T2V 1.3B, max seq len is usually 1024 for RoPE.
+            # Let's ensure we have at least 1024 or cover the video length.
+            # For 81 frames, we might need more if time_shift is large? 
+            # No, RoPE is applied per frame (spatial) and per time.
+            # Time IDs are just 0..F. 
+            # Spatials are 0..H and 0..W.
+            # So 1024 is usually enough for H/W/T dimensions individually.
+            # We will use dynamic size based on needs.
+            
+            req_rope_len = max(1024, max_frame_idx + 1)
+            rope_cos_t, rope_sin_t, rope_cos_h, rope_sin_h, rope_cos_w, rope_sin_w = \
+                self._get_rope_inputs(req_rope_len, device=self.device, dtype=torch.float32)
+
+            # 3. Prepare other inputs
+            
+            # KV cache: list of dicts -> flat tensors
+            all_kv_k, all_kv_v, all_kv_seq_lens, all_local_starts = \
+                self._kv_to_pipeline_cache_flat(kv_cache, B)
+                
+            # Cross-attn cache: list of dicts -> flat tensors
+            all_crossattn_k, all_crossattn_v = \
+                self._crossattn_from_pipeline_cache(crossattn_cache, B)
+                
+            inputs = {
+                'x': x,
+                'timestep': timestep,
+                'context': ctx,
+                'current_start': current_start,
+                'current_end': current_end,
+                'all_kv_k': all_kv_k,
+                'all_kv_v': all_kv_v,
+                'all_kv_seq_lens': all_kv_seq_lens,
+                'all_local_start_indices': all_local_starts,
+                'all_crossattn_k': all_crossattn_k,
+                'all_crossattn_v': all_crossattn_v,
+                'text_mask': text_mask,
+                'rope_cos_t': rope_cos_t,
+                'rope_sin_t': rope_sin_t,
+                'rope_cos_h': rope_cos_h,
+                'rope_sin_h': rope_sin_h,
+                'rope_cos_w': rope_cos_w,
+                'rope_sin_w': rope_sin_w,
+            }
             for i, (mods, entry) in enumerate(zip(self.crossattn_modules, crossattn_cache)):
                 # Ensure ctx matches module weight dtype (modules may not have
                 # been reached by pipeline.to(bfloat16) since they're plain dicts)
