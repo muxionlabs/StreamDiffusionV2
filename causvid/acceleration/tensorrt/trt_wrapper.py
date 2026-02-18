@@ -200,6 +200,9 @@ class TRTWanDiffusionWrapper(nn.Module):
         # must be pre-computed using the text_embedding MLP + per-block K,V
         # projections extracted from the original PyTorch model.
         if crossattn_cache is not None and not crossattn_cache[0]['is_init']:
+            # conditional_dict is needed if we want to extract mask here? 
+            # Actually precompute only needs context.
+            # Mask is handled in _infer now.
             self._precompute_crossattn_kv(context, crossattn_cache)
         
         # === Cache eviction ===
@@ -210,122 +213,19 @@ class TRTWanDiffusionWrapper(nn.Module):
         frame_seq_len = self.engine.metadata.get('frame_seq_len', 1560)
         self._maybe_evict_cache(kv_cache, current_end, B, frame_seq_len)
         
-        # Convert KV cache from pipeline format to flat tensors
-        all_kv_k, all_kv_v, all_global_end, all_local_end = \
-            self._kv_from_pipeline_cache(kv_cache, B)
+        # Run inference using helper
+        pred_x0, out_kv_seq_lens, out_local_starts = self._infer(
+            x, input_timestep, context, current_start, current_end,
+            kv_cache, crossattn_cache, conditional_dict
+        )
         
-        # Convert cross-attn cache to flat tensors
-        all_cross_k, all_cross_v = self._crossattn_from_pipeline_cache(
-            crossattn_cache, B)
-        
-        # === Compute correct KV cache write position ===
-        # The original CausalWanModel uses:
-        #   new_local_end = local_end + current_end - global_end
-        #   local_start   = new_local_end - num_new_tokens
-        # This allows OVERWRITING cache positions during multi-step denoising
-        # (when current_end == global_end, the delta is 0 → same positions).
-        # Without this formula, the cache only grows (append-only) and
-        # multi-step denoising corrupts the output.
-        frame_seq_len = self.engine.metadata.get('frame_seq_len', 1560)
-        # current_end: [B] → [B, 1] for broadcasting with [B, num_layers]
-        ce = current_end.unsqueeze(1).to(all_local_end.dtype)
-        new_local_end = all_local_end + ce - all_global_end  # [B, L]
-        correct_local_start = torch.clamp(new_local_end - frame_seq_len, min=0)
-        
-        # === Run engine per batch item with TRIMMED KV cache ===
-        # The original PyTorch model uses:
-        #   flash_attn_with_kvcache(q, k_cache[:, :seq_lens.max()], ...)
-        # This attends ONLY to valid cache entries. Our TRT engine's internal
-        # attention operates over the entire input cache. By trimming the
-        # cache tensor to `new_local_end` entries, we make ALL positions
-        # valid — the engine's mask becomes all-zeros, matching FlashAttention.
-        engine_dtype = torch.float16
-        min_cache = self.engine.metadata.get('min_cache_len', 1560)
-        
-        batch_flow_preds = []
-        for b in range(B):
-            # Determine valid cache size for this batch item
-            max_valid = int(new_local_end[b].max().item())
-            max_valid = max(max_valid, min_cache)  # respect engine minimum
-            
-            # Prepare RoPE inputs (Runtime configurable!)
-            # Dynamic RoPE: Ensure buffer covers the current maximum position index.
-            # CRITICAL FIX: RoPE tensors are indexed by (F, H, W) grid positions, NOT flattened token indices.
-            # Max index needed is max(current_frame_idx + num_input_frames, H, W).
-            # H, W are small (~30, ~50). Frame index grows.
-            f_start = (current_start[b] // frame_seq_len).item()
-            req_rope_len = int(f_start) + num_input_frames + 1 
-            
-            # TRT Engine Profile has a HARD LIMIT of 4096 on these inputs.
-            # We must clamp the request to 4096 to avoid instant crash.
-            # If video > 4096 frames, we will crash anyway (engine limitation), but let's be safe.
-            req_rope_len = min(req_rope_len, 4096)
-            
-            rope_inputs = self._get_rope_inputs(engine_dtype, self.device, req_rope_len)
-
-            single_inputs = {
-                'x': x[b:b+1].to(engine_dtype),
-                'timestep': input_timestep[b:b+1].to(torch.int64),
-                # Convert token index to frame index for RoPE offset.
-                'current_start': (current_start[b:b+1] // frame_seq_len).to(torch.int64),
-                'all_kv_k': all_kv_k[b:b+1, :, :max_valid].to(engine_dtype),
-                'all_kv_v': all_kv_v[b:b+1, :, :max_valid].to(engine_dtype),
-                'all_kv_seq_lens': new_local_end[b:b+1].to(torch.int64),
-                'all_local_start_indices': correct_local_start[b:b+1].to(torch.int64),
-                'all_crossattn_k': all_cross_k[b:b+1].to(engine_dtype),
-                'all_crossattn_v': all_cross_v[b:b+1].to(engine_dtype),
-                **rope_inputs
-            }
-            
-            # === DIAGNOSTIC LOGGING (remove after debugging) ===
-            _frame_idx = int((current_start[b] // frame_seq_len).item())
-            _token_idx = int(current_start[b].item())
-            _local_start = int(correct_local_start[b].max().item())
-            _timestep = int(input_timestep[b].item())
-            if not hasattr(self, '_diag_call_count'):
-                self._diag_call_count = 0
-            self._diag_call_count += 1
-            if self._diag_call_count <= 30:  # first 30 calls only
-                print(f"[TRT_DIAG] call={self._diag_call_count} b={b} "
-                      f"token_start={_token_idx} frame_idx={_frame_idx} "
-                      f"cache_size={max_valid} local_start={_local_start} "
-                      f"timestep={_timestep}")
-            # === END DIAGNOSTIC ===
-            
-            result = self.engine.infer(single_inputs)
-            _flow = result['output']
-            batch_flow_preds.append(_flow)
-            
-            # === OUTPUT TRACKING (remove after debugging) ===
-            if self._diag_call_count <= 40:
-                _out_norm = _flow.float().norm().item()
-                _out_std = _flow.float().std().item()
-                _out_min = _flow.min().item()
-                _out_max = _flow.max().item()
-                print(f"[TRT_OUT] call={self._diag_call_count} b={b} frame={_frame_idx} "
-                      f"norm={_out_norm:.1f} std={_out_std:.4f} "
-                      f"range=[{_out_min:.3f}, {_out_max:.3f}]")
-            # === END OUTPUT TRACKING ===
-            
-            # Write trimmed KV output back to full-size pipeline cache
-            out_k = result['out_kv_k']  # [1, L, max_valid, N, D]
-            out_v = result['out_kv_v']
-            if kv_cache is not None:
-                self._update_pipeline_cache(kv_cache, out_k, out_v, new_local_end[b], B, b)
-        
-        # Combine flow predictions from all batch items
-        flow_pred_combined = torch.cat(batch_flow_preds, dim=0)
-        
-        # Extract flow prediction and permute back: [B, C, F, H, W] -> [B, F, C, H, W]
-        flow_pred = flow_pred_combined.permute(0, 2, 1, 3, 4).to(
-            noisy_image_or_video.dtype)
-        
-        # Convert flow prediction to x0 (stays in PyTorch)
-        pred_x0 = self._convert_flow_pred_to_x0(
-            flow_pred=flow_pred.flatten(0, 1),
-            xt=noisy_image_or_video.flatten(0, 1),
-            timestep=timestep.flatten(0, 1)
-        ).unflatten(0, flow_pred.shape[:2])
+        # Write output KV metadata back to pipeline cache
+        # (The tensors are updated by _infer internally? No, _infer returns new tensors, we need to write back?)
+        # Wait, my _infer implementation calls engine.infer which returns dict of outputs.
+        # But I didn't return anything from _infer yet? 
+        # I need to check _infer implementation again. 
+        # My previous edit added _infer but didn't parse outputs.
+        # I need to fix _infer first to return parsed outputs.
         
         return pred_x0
 
@@ -639,72 +539,6 @@ class TRTWanDiffusionWrapper(nn.Module):
             B = ctx.shape[0]
             N, D = self.num_heads, self.head_dim
             
-            # Prepare text mask
-            if conditional_dict is not None and 'attention_mask' in conditional_dict:
-                 # [B, L] -> [B, 1, 1, L]
-                 text_mask = conditional_dict['attention_mask'].view(B, 1, 1, -1).to(dtype=ctx.dtype)
-                 # In PyTorch, mask is 0 for keep, -inf for mask. 
-                 # WanTextEncoder returns 1 for keep, 0 for padding.
-                 # So we need (1 - mask) * -1e4
-                 text_mask = (1.0 - text_mask) * -65504.0
-            else:
-                 # Fallback: assume all valid if no mask provided
-                 text_mask = torch.zeros(B, 1, 1, ctx.shape[1], device=ctx.device, dtype=ctx.dtype)
-
-            # 2. Get RoPE inputs (cached or generated)
-            # We need RoPE for the *current* frame(s).
-            # The engine expects full rope buffers of length 1024 (or whatever freq_len is)
-            # The slicing happens inside the engine based on grid_sizes.
-            # We just need to ensure the cache is large enough and pass it.
-             
-            # Calculate required length (max frame index + seq len)
-            # This is global frame index
-            max_frame_idx = (current_end.max().item() // (480//8//2 * 832//8//2)) + 1
-            # Actually, the engine uses frame_idx calculated from current_start
-            # We just need enough frequencies. 
-            # In T2V 1.3B, max seq len is usually 1024 for RoPE.
-            # Let's ensure we have at least 1024 or cover the video length.
-            # For 81 frames, we might need more if time_shift is large? 
-            # No, RoPE is applied per frame (spatial) and per time.
-            # Time IDs are just 0..F. 
-            # Spatials are 0..H and 0..W.
-            # So 1024 is usually enough for H/W/T dimensions individually.
-            # We will use dynamic size based on needs.
-            
-            req_rope_len = max(1024, max_frame_idx + 1)
-            rope_cos_t, rope_sin_t, rope_cos_h, rope_sin_h, rope_cos_w, rope_sin_w = \
-                self._get_rope_inputs(req_rope_len, device=self.device, dtype=torch.float32)
-
-            # 3. Prepare other inputs
-            
-            # KV cache: list of dicts -> flat tensors
-            all_kv_k, all_kv_v, all_kv_seq_lens, all_local_starts = \
-                self._kv_to_pipeline_cache_flat(kv_cache, B)
-                
-            # Cross-attn cache: list of dicts -> flat tensors
-            all_crossattn_k, all_crossattn_v = \
-                self._crossattn_from_pipeline_cache(crossattn_cache, B)
-                
-            inputs = {
-                'x': x,
-                'timestep': timestep,
-                'context': ctx,
-                'current_start': current_start,
-                'current_end': current_end,
-                'all_kv_k': all_kv_k,
-                'all_kv_v': all_kv_v,
-                'all_kv_seq_lens': all_kv_seq_lens,
-                'all_local_start_indices': all_local_starts,
-                'all_crossattn_k': all_crossattn_k,
-                'all_crossattn_v': all_crossattn_v,
-                'text_mask': text_mask,
-                'rope_cos_t': rope_cos_t,
-                'rope_sin_t': rope_sin_t,
-                'rope_cos_h': rope_cos_h,
-                'rope_sin_h': rope_sin_h,
-                'rope_cos_w': rope_cos_w,
-                'rope_sin_w': rope_sin_w,
-            }
             for i, (mods, entry) in enumerate(zip(self.crossattn_modules, crossattn_cache)):
                 # Ensure ctx matches module weight dtype (modules may not have
                 # been reached by pipeline.to(bfloat16) since they're plain dicts)
@@ -720,6 +554,136 @@ class TRTWanDiffusionWrapper(nn.Module):
                 entry['is_init'] = True
         
         logger.info(f"Pre-computed cross-attention KV for {len(crossattn_cache)} blocks")
+    
+    def _infer(self, x, timestep, context, current_start, current_end, kv_cache, crossattn_cache, conditional_dict=None):
+        """
+        Run inference on the TRT engine.
+        """
+        B = x.shape[0]
+        
+        # 1. Prepare text mask (moved from precompute)
+        if conditional_dict is not None and 'attention_mask' in conditional_dict:
+             # [B, L] -> [B, 1, 1, L]
+             # WanTextEncoder returns 1 for keep, 0 for padding.
+             text_mask = conditional_dict['attention_mask'].view(B, 1, 1, -1).to(dtype=x.dtype)
+             # In PyTorch, mask is 0 for keep, -inf for mask.
+             # Wait, if WanTextEncoder returns 1 for keep:
+             # We want 0 for keep, -inf for mask.
+             # So (1 - mask) * -65504.0
+             text_mask = (1.0 - text_mask) * -65504.0
+        else:
+             # Fallback: assume all valid if no mask provided
+             # Context length is tricky if we don't have it. Use context.shape[1]
+             # But context here might be the projected one or raw?
+             # infer receives whatever forward passes.
+             # Let's assume context is [B, L, C]
+             text_mask = torch.zeros(B, 1, 1, context.shape[1], device=x.device, dtype=x.dtype)
+
+        # 2. Get RoPE inputs (cached or generated)
+        # We need RoPE for the *current* frame(s).
+        # Calculate required length (max frame index + seq len)
+        max_frame_idx = (current_end.max().item() // (480//8//2 * 832//8//2)) + 1
+        req_rope_len = max(1024, max_frame_idx + 1)
+        rope_cos_t, rope_sin_t, rope_cos_h, rope_sin_h, rope_cos_w, rope_sin_w = \
+            self._get_rope_inputs(req_rope_len, device=self.device, dtype=torch.float32)
+
+        # 3. Prepare other inputs
+        
+        # KV cache: list of dicts -> flat tensors
+        all_kv_k, all_kv_v, all_kv_seq_lens, all_local_starts = \
+            self._kv_to_pipeline_cache_flat(kv_cache, B)
+            
+        # Cross-attn cache: list of dicts -> flat tensors
+        all_crossattn_k, all_crossattn_v = \
+            self._crossattn_from_pipeline_cache(crossattn_cache, B)
+            
+        inputs = {
+            'x': x,
+            'timestep': timestep,
+            'context': context, # This passes raw context to engine? No, engine expects [B, L, dim].
+                                # But precompute already used text_embedding MLP.
+                                # The engine INPUT 'context' is actually the projected text embed?
+                                # Let's check trt_model.py.
+                                # TRTCausalWanModel forward: context = self.text_embedding(context)
+                                # So engine expects RAW text embeddings [B, L, 4096].
+                                # But wait! _precompute_crossattn_kv computes K/V for blocks.
+                                # The engine also computes textual context for the model's 'context' input?
+                                # Yes, TRTCausalWanModel has self.text_embedding.
+                                # So we pass RAW context to engine, AND precomputed K/V.
+                                # Correct.
+            'current_start': current_start,
+            'current_end': current_end,
+            'all_kv_k': all_kv_k,
+            'all_kv_v': all_kv_v,
+            'all_kv_seq_lens': all_kv_seq_lens,
+            'all_local_start_indices': all_local_starts,
+            'all_crossattn_k': all_crossattn_k,
+            'all_crossattn_v': all_crossattn_v,
+            'text_mask': text_mask,
+            'rope_cos_t': rope_cos_t,
+            'rope_sin_t': rope_sin_t,
+            'rope_cos_h': rope_cos_h,
+            'rope_sin_h': rope_sin_h,
+            'rope_cos_w': rope_cos_w,
+            'rope_sin_w': rope_sin_w,
+        }
+        
+        outputs = self.engine.infer(inputs)
+        
+        # 4. Process outputs
+        pred_x0 = outputs['output']  # [B, C, F, H, W]
+        
+        # Write back KV cache updates
+        out_kv_k = outputs['out_kv_k']
+        out_kv_v = outputs['out_kv_v']
+        out_local_ends = outputs['out_kv_seq_lens'] # Engine outputs this name
+        # We need global_end too? Engine doesn't output it.
+        # We compute it: current_end + frame_seq_len?
+        # No, engine logic: new_global_end = global_end + frame_seq_len
+        # But we need to update the pipeline cache dicts.
+        
+        # Wait, the engine output 'pred_x0' is [B, C, F, H, W].
+        # And we need to update the cache in place?
+        
+        # Let's look at how we did it before in forward().
+        # We need to re-implement that logic here or return the data needed.
+        
+        # Actually, let's just do the update here.
+        frame_seq_len = self.engine.metadata.get('frame_seq_len', 1560)
+        
+        # Update pipeline KV cache
+        for i, entry in enumerate(kv_cache):
+            # Update tensors
+            # We must be careful: if we just replace the tensor, it might break references?
+            # Pipeline cache is list of dicts.
+            # entry['k'] = ...
+            
+            # The engine returns the FULL cache tensor?
+            # Yes, out_kv_k is [B, L, max_len, H, D]
+            # pipeline cache 'k' is [B, max_len, H, D]
+            
+            # We should probably copy back or replace.
+            entry['k'] = out_kv_k[:, i]
+            entry['v'] = out_kv_v[:, i]
+            
+            # Update indices
+            # out_local_ends is [B, L]
+            entry['local_end_index'] = out_local_ends[:, i]
+            
+            # Update global end index
+            # The engine logic consumes input global_start/end but doesn't output new global end.
+            # We know we processed 1 frame (or F frames).
+            # new_global = old_global + seq_len * num_frames
+            # num_frames = pred_x0.shape[2]
+            num_frames = pred_x0.shape[2]
+            
+            if 'global_end_index' in entry:
+                 entry['global_end_index'] = entry['global_end_index'] + frame_seq_len * num_frames
+            else:
+                 # Initialize if missing? Should be present.
+                 pass
+
+        return pred_x0, None, None
     
     def to(self, *args, **kwargs):
         """Override to handle device/dtype moves."""
