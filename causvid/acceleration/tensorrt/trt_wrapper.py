@@ -792,19 +792,31 @@ class TRTWanDiffusionWrapper(nn.Module):
             entry['v'] = out_kv_v[:, i]
             
             # Manual update of indices
-            # The TRT engine output 'out_kv_seq_lens' corresponds to global_end,
-            # but we've seen it return garbage values. It's safer to update
-            # indices manually based on the known frame length processed.
+            # We must detect if we are appending (New Frame) or Overwriting (Refinement).
+            # The delta is determined by how much current_end exceeds the previous global_end.
+            # current_end is [B]. global_end_index is [B].
             
-            # Update local_end (write pointer)
-            # We assume sequential writing. If we just wrote to the cache,
-            # we likely appended 'frame_seq_len' tokens per frame.
-            if 'local_end_index' in entry:
-                 entry['local_end_index'] = entry['local_end_index'] + frame_seq_len * num_frames
-            
-            # Update global end index
-            if 'global_end_index' in entry:
-                 entry['global_end_index'] = entry['global_end_index'] + frame_seq_len * num_frames
+            if 'local_end_index' in entry and 'global_end_index' in entry:
+                 # Calculate delta [B]
+                 # Note: current_end is passed to _infer.
+                 # global_end_index is in entry.
+                 # We shouldn't use frame_seq_len * num_frames blindly.
+                 
+                 curr_ge = entry['global_end_index']
+                 # Ensure shapes match
+                 if curr_ge.shape != current_end.shape:
+                      # This should match B
+                      pass
+                 
+                 delta = current_end - curr_ge
+                 # If delta < 0, it implies we are writing far back?
+                 # Assuming usually delta >= 0 for causal stream.
+                 # Or if delta=0 (overwrite).
+                 # We clamp max(0, delta) just in case?
+                 # Actually for valid stream, delta should be exactly 0 or frame_seq_len.
+                 
+                 entry['local_end_index'] = entry['local_end_index'] + delta
+                 entry['global_end_index'] = entry['global_end_index'] + delta
             else:
                  # Initialize if missing? Should be present.
                  pass
