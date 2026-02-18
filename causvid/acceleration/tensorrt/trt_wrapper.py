@@ -147,9 +147,9 @@ class TRTWanDiffusionWrapper(nn.Module):
         # DEBUG LOGGING
         if not hasattr(self, '_diag_frame_count'): self._diag_frame_count = 0
         self._diag_frame_count += 1
-        if self._diag_frame_count <= 5:
-             print(f"[TRT_WRAPPER] forward input: {noisy_image_or_video.shape}")
-             print(f"[TRT_WRAPPER] num_input_frames: {num_input_frames}")
+        # if self._diag_frame_count <= 5:
+        #      print(f"[TRT_WRAPPER] forward input: {noisy_image_or_video.shape}")
+        #      print(f"[TRT_WRAPPER] num_input_frames: {num_input_frames}")
 
         
         # === Multi-frame sequential processing ===
@@ -415,14 +415,9 @@ class TRTWanDiffusionWrapper(nn.Module):
                     
                     if num_rolled > 0:
                         # Debugging crash
-                        if layer_entry['k'].shape[1] < sink_tokens + num_rolled:
-                            print(f"[TRT_WRAPPER_ERR] Eviction Crash Check:")
-                            print(f"  Batch={b}, Layer K Shape={layer_entry['k'].shape}")
-                            print(f"  LocalEnd={le}, CurrentEnd={ce}, GlobalEnd={ge}")
-                            print(f"  NewLocalEnd={new_le}, MaxCache={max_cache_len}")
-                            print(f"  SinkTokens={sink_tokens}, NumEvicted={num_evicted}, NumRolled={num_rolled}")
-                            print(f"  LHS Slice End={sink_tokens + num_rolled}")
-                            print(f"  RHS Slice Start={sink_tokens + num_evicted}, End={sink_tokens + num_evicted + num_rolled}")
+                        # if layer_entry['k'].shape[1] < sink_tokens + num_rolled:
+                        #     print(f"[TRT_WRAPPER_ERR] Eviction Crash Check:")
+                        #     ...
 
                         layer_entry['k'][b, sink_tokens:sink_tokens + num_rolled] = \
                             layer_entry['k'][b, sink_tokens + num_evicted:
@@ -638,14 +633,16 @@ class TRTWanDiffusionWrapper(nn.Module):
         }
         
         if self._diag_frame_count <= 5:
-             print(f"[TRT_WRAPPER] _infer inputs['x']: {x.shape}")
+             # print(f"[TRT_WRAPPER] _infer inputs['x']: {x.shape}")
+             pass
         
         outputs = self.engine.infer(inputs)
         
         # 4. Process outputs
         pred_x0 = outputs['output']  # [B, C, F, H, W]
         # Permute to [B, F, C, H, W] to match PyTorch pipeline expectation
-        pred_x0 = pred_x0.permute(0, 2, 1, 3, 4).contiguous()
+        # AND cast to input dtype (e.g. bfloat16) because engine might return float32
+        pred_x0 = pred_x0.permute(0, 2, 1, 3, 4).contiguous().to(dtype=x.dtype)
         
         # Write back KV cache updates
         out_kv_k = outputs['out_kv_k']
