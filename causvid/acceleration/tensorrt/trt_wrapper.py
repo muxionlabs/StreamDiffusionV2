@@ -585,7 +585,7 @@ class TRTWanDiffusionWrapper(nn.Module):
         max_frame_idx = (current_end.max().item() // (480//8//2 * 832//8//2)) + 1
         req_rope_len = max(1024, max_frame_idx + 1)
         rope_cos_t, rope_sin_t, rope_cos_h, rope_sin_h, rope_cos_w, rope_sin_w = \
-            self._get_rope_inputs(req_rope_len, device=self.device, dtype=torch.float32)
+            self._get_rope_inputs(torch.float32, self.device, req_rope_len)
 
         # 3. Prepare other inputs
         
