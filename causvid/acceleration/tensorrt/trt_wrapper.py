@@ -29,14 +29,14 @@ class TRTWanDiffusionWrapper(nn.Module):
     CausalStreamInferencePipeline.inference_stream() calls:
     
         self.generator(
-            noisy_image_or_video=...,   # [B, F, C, H, W]
+            noisy_image_or_video=...,   # [B, C, F, H, W]
             conditional_dict=...,       # dict with 'prompt_embeds' key
             timestep=...,               # [B, F]
             kv_cache=...,               # list of dicts
             crossattn_cache=...,        # list of dicts
             current_start=...,          # [B] int64 tensor
             current_end=...,            # [B] int64 tensor
-        ) -> denoised_pred [B, F, C, H, W]
+        ) -> denoised_pred [B, C, F, H, W]
     """
     
     def __init__(
@@ -130,7 +130,7 @@ class TRTWanDiffusionWrapper(nn.Module):
         Forward pass — EXACT same signature as WanDiffusionWrapper.forward().
         
         Args:
-            noisy_image_or_video: [B, F, C, H, W] — noisy latent
+            noisy_image_or_video: [B, C, F, H, W] — noisy latent
             conditional_dict: dict with 'prompt_embeds' -> list of [L, C_text] tensors
             timestep: [B, F] — timestep per frame
             kv_cache: list[dict] per transformer layer
@@ -139,22 +139,19 @@ class TRTWanDiffusionWrapper(nn.Module):
             current_end: [B] int64 — KV cache end position
         
         Returns:
-            pred_x0: [B, F, C, H, W] — denoised prediction
+            pred_x0: [B, C, F, H, W] — denoised prediction
         """
-        num_input_frames = noisy_image_or_video.shape[1]
+        # Input is [B, C, F, H, W]
+        num_input_frames = noisy_image_or_video.shape[2]
         
         # === Multi-frame sequential processing ===
-        # The TRT engine was traced with num_frames=1, so internal reshapes
-        # have num_frames baked as 1. When prepare() sends 2+ frames, we
-        # process each frame sequentially — mathematically equivalent for a
-        # causal model since each frame only attends to previous frames via
-        # the KV cache.
+        # The TRT engine was traced with num_frames=1.
         if num_input_frames > 1:
             frame_seq_len = self.engine.metadata.get('frame_seq_len', 1560)
             all_pred_x0 = []
             
             for f in range(num_input_frames):
-                single_frame = noisy_image_or_video[:, f:f+1]  # [B, 1, C, H, W]
+                single_frame = noisy_image_or_video[:, :, f:f+1]  # [B, C, 1, H, W]
                 single_ts = timestep[:, f:f+1]                  # [B, 1]
                 frame_start = current_start + f * frame_seq_len
                 frame_end = frame_start + frame_seq_len
@@ -167,7 +164,7 @@ class TRTWanDiffusionWrapper(nn.Module):
                 )
                 all_pred_x0.append(pred_x0)
             
-            return torch.cat(all_pred_x0, dim=1)  # [B, F, C, H, W]
+            return torch.cat(all_pred_x0, dim=2)  # [B, C, F, H, W]
         
         # === Single-frame processing (normal path) ===
         prompt_embeds = conditional_dict["prompt_embeds"]
@@ -180,8 +177,8 @@ class TRTWanDiffusionWrapper(nn.Module):
         
         B = noisy_image_or_video.shape[0]
         
-        # Permute: [B, F, C, H, W] -> [B, C, F, H, W] (model input format)
-        x = noisy_image_or_video.permute(0, 2, 1, 3, 4).contiguous()
+        # Model expects [B, C, F, H, W]. Input is already in this format.
+        x = noisy_image_or_video.contiguous()
         
         # Prepare context: stack prompt embeds and pad to text_len
         context_list = []
