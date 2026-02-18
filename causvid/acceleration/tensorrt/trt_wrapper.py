@@ -591,7 +591,7 @@ class TRTWanDiffusionWrapper(nn.Module):
         
         # KV cache: list of dicts -> flat tensors
         all_kv_k, all_kv_v, all_kv_seq_lens, all_local_starts = \
-            self._kv_to_pipeline_cache_flat(kv_cache, B)
+            self._kv_from_pipeline_cache(kv_cache, B)
             
         # Cross-attn cache: list of dicts -> flat tensors
         all_crossattn_k, all_crossattn_v = \
