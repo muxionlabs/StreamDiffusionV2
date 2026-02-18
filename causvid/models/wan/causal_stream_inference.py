@@ -256,6 +256,27 @@ class CausalStreamInferencePipeline(torch.nn.Module):
         self.hidden_states[1:] = self.hidden_states[:-1].clone()
         self.hidden_states[0] = noise[0]
 
+        # Shift KV cache tensors to align with hidden_states shift.
+        # Batch index i (handling frame T-i) moves to i+1 (handling frame T-(i+1)).
+        # It needs the cache history from index i.
+        # We must shift the actual data in kv_cache1.
+        for i_layer in range(self.num_transformer_blocks):
+             k = self.kv_cache1[i_layer]['k']
+             v = self.kv_cache1[i_layer]['v']
+             # k is [B, L, H, D]
+             k[1:] = k[:-1].clone()
+             v[1:] = v[:-1].clone()
+             # We assume index 0 will be overwritten by new frame processing?
+             # Yes, generator writes to current slot.
+             
+             # Also shift indices?
+             # local_end_index is [B]
+             le = self.kv_cache1[i_layer]['local_end_index']
+             le[1:] = le[:-1].clone()
+             
+             ge = self.kv_cache1[i_layer]['global_end_index']
+             ge[1:] = ge[:-1].clone()
+
         self.kv_cache_starts[1:] = self.kv_cache_starts[:-1].clone()
         self.kv_cache_starts[0] = current_start
         
