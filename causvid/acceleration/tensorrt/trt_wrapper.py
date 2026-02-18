@@ -664,33 +664,26 @@ class TRTWanDiffusionWrapper(nn.Module):
         
         # Actually, let's just do the update here.
         frame_seq_len = self.engine.metadata.get('frame_seq_len', 1560)
-        
+        num_frames = pred_x0.shape[1] # F, since we permuted pred_x0 above
+
         # Update pipeline KV cache
         for i, entry in enumerate(kv_cache):
             # Update tensors
-            # We must be careful: if we just replace the tensor, it might break references?
-            # Pipeline cache is list of dicts.
-            # entry['k'] = ...
-            
-            # The engine returns the FULL cache tensor?
-            # Yes, out_kv_k is [B, L, max_len, H, D]
-            # pipeline cache 'k' is [B, max_len, H, D]
-            
-            # We should probably copy back or replace.
             entry['k'] = out_kv_k[:, i]
             entry['v'] = out_kv_v[:, i]
             
-            # Update indices
-            # out_local_ends is [B, L]
-            entry['local_end_index'] = out_local_ends[:, i]
+            # Manual update of indices
+            # The TRT engine output 'out_kv_seq_lens' corresponds to global_end,
+            # but we've seen it return garbage values. It's safer to update
+            # indices manually based on the known frame length processed.
+            
+            # Update local_end (write pointer)
+            # We assume sequential writing. If we just wrote to the cache,
+            # we likely appended 'frame_seq_len' tokens per frame.
+            if 'local_end_index' in entry:
+                 entry['local_end_index'] = entry['local_end_index'] + frame_seq_len * num_frames
             
             # Update global end index
-            # The engine logic consumes input global_start/end but doesn't output new global end.
-            # We know we processed 1 frame (or F frames).
-            # new_global = old_global + seq_len * num_frames
-            # num_frames = pred_x0.shape[2]
-            num_frames = pred_x0.shape[2]
-            
             if 'global_end_index' in entry:
                  entry['global_end_index'] = entry['global_end_index'] + frame_seq_len * num_frames
             else:
