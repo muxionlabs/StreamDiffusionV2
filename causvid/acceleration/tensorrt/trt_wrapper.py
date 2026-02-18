@@ -644,6 +644,8 @@ class TRTWanDiffusionWrapper(nn.Module):
         
         # 4. Process outputs
         pred_x0 = outputs['output']  # [B, C, F, H, W]
+        # Permute to [B, F, C, H, W] to match PyTorch pipeline expectation
+        pred_x0 = pred_x0.permute(0, 2, 1, 3, 4).contiguous()
         
         # Write back KV cache updates
         out_kv_k = outputs['out_kv_k']
