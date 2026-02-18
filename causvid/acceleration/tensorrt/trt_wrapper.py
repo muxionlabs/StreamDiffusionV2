@@ -142,7 +142,124 @@ class TRTWanDiffusionWrapper(nn.Module):
             pred_x0: [B, F, C, H, W] — denoised prediction
         """
         # Input is [B, F, C, H, W]
+        # Input is [B, F, C, H, W]
         num_input_frames = noisy_image_or_video.shape[1]
+        B = noisy_image_or_video.shape[0]
+
+        # === Batch Splitting for Single-Batch Engine ===
+        # The TRT engine is built for Batch=1. If we receive Batch > 1 (e.g. multiple
+        # denoising steps in parallel), we must sequentialize execution.
+        if B > 1:
+             all_batch_p0 = []
+             frame_seq_len = self.engine.metadata.get('frame_seq_len', 1560)
+             
+             # Pre-compute cross-attn once for full batch (it updates cache in-place)
+             # We need to do this here because if we split, the sub-calls might re-trigger
+             # computation if is_init is strictly checked per call.
+             # However, is_init is global per layer.
+             # Let's rely on the recursive call to handle it?
+             # If we pass sliced cache, is_init flag is shared?
+             # No, standard dict slicing creates new dicts.
+             
+             for b in range(B):
+                  # Slice inputs
+                  x_b = noisy_image_or_video[b:b+1] # [1, F, C, H, W]
+                  ts_b = timestep[b:b+1]            # [1, F]
+                  cs_b = current_start[b:b+1]       # [1]
+                  ce_b = current_end[b:b+1]         # [1]
+                  
+                  # Slice prompt embeds (list of tensors)
+                  cond_b = {
+                      k: v for k, v in conditional_dict.items() if k != 'prompt_embeds'
+                  }
+                  # prompt_embeds is [B, L, C] list? No, usually list of tensors?
+                  # In inference.py: self.conditional_dict['prompt_embeds'] = ... .repeat(batch_size, 1, 1)
+                  # So it is a Tensor [B, L, C].
+                  # Wait, wrapper docstring says "dict with 'prompt_embeds' -> list of [L, C_text] tensors"
+                  # But inference.py passes a repeated TENSOR.
+                  # Let's check wrapper line 192: `for emb in prompt_embeds:`
+                  # If it's a tensor [B, L, C], iterating gives [L, C] slices (which is B items?)
+                  # No, iterating a [B, L, C] tensor gives B tensors of shape [L, C].
+                  # So prompt_embeds IS a tensor [B, L, C] effectively?
+                  # Yes.
+                  
+                  pe = conditional_dict['prompt_embeds']
+                  if isinstance(pe, list):
+                       # If list of tensors, slice list
+                       pe_b = pe[b:b+1]
+                  else:
+                       # If tensor, slice dim 0
+                       pe_b = pe[b:b+1] # [1, L, C]
+                       # But wrapper expects list?
+                       # Line 192: `for emb in prompt_embeds:` ... context_list.append(emb)
+                       # If pe_b is [1, L, C], iterating gives 1 item [L, C].
+                       # This matches wrapper expectation for Batch=1.
+                  
+                  cond_b['prompt_embeds'] = pe_b
+                  
+                  # Slice and construct temporary KV cache
+                  kv_cache_b = []
+                  for entry in kv_cache:
+                      kv_cache_b.append({
+                          'k': entry['k'][b:b+1], # View
+                          'v': entry['v'][b:b+1],
+                          'local_end_index': entry['local_end_index'][b:b+1],
+                          'global_end_index': entry['global_end_index'][b:b+1],
+                      })
+                  
+                  # Slice crossattn cache
+                  crossattn_cache_b = []
+                  for entry in crossattn_cache:
+                       # We need to preserve is_init state?
+                       # New dict, so is_init is copied/independent.
+                       crossattn_cache_b.append({
+                            'k': entry['k'][b:b+1],
+                            'v': entry['v'][b:b+1],
+                            'is_init': entry['is_init'] 
+                            # If is_init is True, k/v are valid.
+                            # If False, recursive call will compute.
+                       })
+                  
+                  # Recursive call
+                  pred_b = self.forward(
+                       x_b, cond_b, ts_b, kv_cache_b, crossattn_cache_b, cs_b, ce_b
+                  )
+                  all_batch_p0.append(pred_b)
+                  
+                  # Write back Cache Updates (Crucial)
+                  for i, entry in enumerate(kv_cache):
+                       # We copy from kv_cache_b (which has Updated Tensors from _infer)
+                       # back to the specific batch slice of the original cache.
+                       entry['k'][b:b+1] = kv_cache_b[i]['k']
+                       entry['v'][b:b+1] = kv_cache_b[i]['v']
+                       entry['local_end_index'][b:b+1] = kv_cache_b[i]['local_end_index']
+                       entry['global_end_index'][b:b+1] = kv_cache_b[i]['global_end_index']
+                       
+                  # Write back crossattn cache?
+                  # Only if it was initialized inside.
+                  for i, entry in enumerate(crossattn_cache):
+                       if not entry['is_init'] and crossattn_cache_b[i]['is_init']:
+                            entry['k'][b:b+1] = crossattn_cache_b[i]['k']
+                            entry['v'][b:b+1] = crossattn_cache_b[i]['v']
+                            # We can't set entry['is_init'] to True globally until ALL batches are init?
+                            # Or we just leave it. If next batch comes, it checks its slice?
+                            # No, entry['is_init'] is scalar bool.
+                            # If we set it True, we assume ALL batches are init.
+                            # So we should only set it True if we are at the last batch?
+                            # Or we ignore is_init writeback and rely on per-call check?
+                            # If we leave it False, next call for b=0 will recompute? YES.
+                            # This is acceptable (some redundant compute on first step).
+                            # Or we can set it True here?
+                            pass
+             
+             # After loop, if we want to avoid re-computation next time:
+             # We should theoretically set crossattn_cache['is_init'] = True
+             # But only if all were successful.
+             if all(c[0]['is_init'] for c in [crossattn_cache_b]): # simplistic check
+                  for entry in crossattn_cache:
+                       entry['is_init'] = True
+             
+             return torch.cat(all_batch_p0, dim=0) # [B, F, C, H, W]
         
         # DEBUG LOGGING
         if not hasattr(self, '_diag_frame_count'): self._diag_frame_count = 0

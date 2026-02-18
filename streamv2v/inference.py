@@ -255,8 +255,7 @@ class SingleGPUInferencePipeline:
             block_mode='input',
             noise=noise,
             current_start=current_start,
-            current_end=current_end,
-            batch_denoise=False  # TRT engine expects Batch=1
+            current_end=current_end
         )
         return denoised_pred
     
