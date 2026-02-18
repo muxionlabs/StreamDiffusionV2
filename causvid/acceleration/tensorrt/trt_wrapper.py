@@ -333,6 +333,11 @@ class TRTWanDiffusionWrapper(nn.Module):
         # frames) are always preserved; the oldest non-sink entries are
         # discarded to make room for new entries.
         frame_seq_len = self.engine.metadata.get('frame_seq_len', 1560)
+        
+        # DEBUG: Check KV cache shape
+        if kv_cache and len(kv_cache) > 0:
+             print(f"[TRT_DEBUG] kv_cache[0]['k'] shape: {kv_cache[0]['k'].shape}")
+             
         self._maybe_evict_cache(kv_cache, current_end, B, frame_seq_len)
         
         # Run inference using helper
