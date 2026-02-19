@@ -335,8 +335,8 @@ class TRTWanDiffusionWrapper(nn.Module):
         frame_seq_len = self.engine.metadata.get('frame_seq_len', 1560)
         
         # DEBUG: Check KV cache shape
-        if kv_cache and len(kv_cache) > 0:
-             print(f"[TRT_DEBUG] kv_cache[0]['k'] shape: {kv_cache[0]['k'].shape}")
+        # if kv_cache and len(kv_cache) > 0:
+        #      print(f"[TRT_DEBUG] kv_cache[0]['k'] shape: {kv_cache[0]['k'].shape}")
              
         self._maybe_evict_cache(kv_cache, current_end, B, frame_seq_len)
         
@@ -418,10 +418,10 @@ class TRTWanDiffusionWrapper(nn.Module):
         freqs_h = full_freqs[:, c_t:c_t+c_h]
         freqs_w = full_freqs[:, c_t+c_h:]
         
-        print(f"[DEBUG_ROPE] TRUE BASELINE ACTIVE")
-        print(f"[DEBUG_ROPE] freqs_t shape: {freqs_t.shape}")
-        print(f"[DEBUG_ROPE] freqs_h shape: {freqs_h.shape}")
-        print(f"[DEBUG_ROPE] freqs_w shape: {freqs_w.shape}")
+        # print(f"[DEBUG_ROPE] TRUE BASELINE ACTIVE")
+        # print(f"[DEBUG_ROPE] freqs_t shape: {freqs_t.shape}")
+        # print(f"[DEBUG_ROPE] freqs_h shape: {freqs_h.shape}")
+        # print(f"[DEBUG_ROPE] freqs_w shape: {freqs_w.shape}")
 
         '''
         # 7. SYNTHETIC SCALING STRATEGY (DISABLED)
@@ -728,11 +728,20 @@ class TRTWanDiffusionWrapper(nn.Module):
         all_crossattn_k, all_crossattn_v = \
             self._crossattn_from_pipeline_cache(crossattn_cache, B)
             
+        if text_mask is None:
+             # Generate mask from context
+             # context is [B, L, C]. We assume padded vectors are all zeros.
+             # check sum of abs values along C
+             is_valid = context.abs().sum(dim=-1) > 0 # [B, L]
+             # Expand to [B, 1, 1, L]
+             text_mask = is_valid.unsqueeze(1).unsqueeze(1) # [B, 1, 1, L]
+             
         inputs = {
             'x': x,
             'timestep': timestep,
-            'context': context, # This passes raw context to engine? No, engine expects [B, L, dim].
-                                # But precompute already used text_embedding MLP.
+            'context': context, 
+            'text_mask': text_mask.to(dtype=torch.int32), # Engine expects int32/bool? Let's try int32.
+            'y': y,
                                 # The engine INPUT 'context' is actually the projected text embed?
                                 # Let's check trt_model.py.
                                 # TRTCausalWanModel forward: context = self.text_embedding(context)
